@@ -1,0 +1,4 @@
+control pid=5863 version=2.2.5
+worker-a pid=6458 version=2.2.5
+worker-b pid=6551 version=2.2.5
+8d060e1d2fbb9bb44cf09ae6ed1f3f6a7cff070b5227e2f90970132b23a92050
