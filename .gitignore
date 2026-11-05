@@ -1,0 +1,11 @@
+secrets/
+**/data/
+**/state/
+**/cache/
+**/config/
+**/runner/
+**/work/
+central/runtime.sqlite*
+logs/
+evidence/**/probe/
+target/
