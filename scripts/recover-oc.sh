@@ -5,8 +5,9 @@ set -u
 LAB=/root/workspace/runtime-v2-lab
 mkdir -p $LAB/logs
 
-# 1) 网关隧道（经 vps）
-if ! curl -fsS --max-time 3 http://127.0.0.1:13425/v1/models -o /dev/null 2>/dev/null; then
+# 1) 网关隧道（经 vps）——健康检查带认证头，避免误报
+GWKEY="$(jq -r .apiKey $LAB/secrets/magpie-provider.json 2>/dev/null)"
+if ! curl -fsS --max-time 3 -H "Authorization: Bearer $GWKEY" http://127.0.0.1:13425/v1/models -o /dev/null 2>/dev/null; then
   pkill -f 'ssh -fN -L 13425' 2>/dev/null
   setsid nohup ssh -fN -L 13425:10.144.144.3:3425 -p 12224 -i /root/.ssh/id_mesh \
     -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
@@ -34,4 +35,4 @@ for spec in control:4096 worker-a:4097 worker-b:4098; do
   pid=$(curl -fsS --max-time 3 -u "opencode:$pass" http://127.0.0.1:$port/api/info 2>/dev/null | jq -r '.pid // "down"')
   echo "$node port=$port pid=$pid"
 done
-curl -fsS --max-time 3 http://127.0.0.1:13425/v1/models -o /dev/null 2>/dev/null && echo "gateway=up" || echo "gateway=DOWN"
+curl -fsS --max-time 3 -H "Authorization: Bearer $GWKEY" http://127.0.0.1:13425/v1/models -o /dev/null 2>/dev/null && echo "gateway=up" || echo "gateway=DOWN"
