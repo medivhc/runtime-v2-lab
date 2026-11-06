@@ -3,7 +3,7 @@ node_id = "worker-a"
 role = "worker"
 capabilities = ["fixture-exec"]
 capacity = 1
-runtime_url = "http://127.0.0.1:8080"
+runtime_url = "http://127.0.0.1:18080"
 runtime_token_env = "RUNTIME_WORKER_A_TOKEN"
 opencode_url = "http://127.0.0.1:4097"
 opencode_password_env = "OC_WORKER_A_PASSWORD"
@@ -13,4 +13,4 @@ poll_seconds = 2
 heartbeat_seconds = 5
 
 [repositories]
-fixture = "/root/workspace/runtime-v2-lab/fixture/fixture.git"
+fixture = "/root/workspace/runtime-v2-lab/fixture.git"

@@ -1145,6 +1145,14 @@ impl Store {
              WHERE run_id=?1",
             params![run_id, run_state_str(to), session_id, candidate_sha],
         )?;
+        // An execute run failing (or being canceled) reopens its task so the
+        // operator can retry; spec 5 keeps the reason on the run row.
+        if to == RunState::Failed || to == RunState::Canceled {
+            tx.execute(
+                "UPDATE tasks SET state='queued' WHERE task_id=(SELECT task_id FROM runs WHERE run_id=?1) AND state='running'",
+                params![run_id],
+            )?;
+        }
         Self::append_event_tx(
             &tx,
             run_id,
