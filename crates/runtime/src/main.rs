@@ -4,6 +4,8 @@
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+mod runner;
+
 #[derive(Parser)]
 #[command(name = "runtime", version)]
 struct Cli {
@@ -142,23 +144,13 @@ async fn main() -> anyhow::Result<()> {
             axum::serve(listener, app).await?;
         }
         Cmd::Runner { config } => {
-            // Runner implementation lands with TASK-005 (M1b/M2); here we
-            // validate the runner config shape early.
-            let raw = std::fs::read_to_string(&config)?;
-            let v: toml::Value = toml::from_str(&raw)?;
-            let node_id = v
-                .get("node_id")
-                .and_then(|x| x.as_str())
-                .ok_or_else(|| anyhow::anyhow!("runner config: node_id required"))?
-                .to_string();
-            let runtime_url = v
-                .get("runtime_url")
-                .and_then(|x| x.as_str())
-                .ok_or_else(|| anyhow::anyhow!("runner config: runtime_url required"))?
-                .to_string();
-            eprintln!(
-                "runner config ok: node={node_id} runtime={runtime_url}; runner loop not started (TASK-005)"
-            );
+            let cfg = runner::RunnerConfig::load(&config)?;
+            let r = runner::Runner::new(cfg);
+            if r.cfg.role == "control" {
+                r.control_loop().await?;
+            } else {
+                r.worker_loop().await?;
+            }
         }
         Cmd::Submit {
             repo,

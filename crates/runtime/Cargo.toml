@@ -11,6 +11,7 @@ path = "src/main.rs"
 domain = { path = "../domain" }
 store = { path = "../store" }
 service = { path = "../service" }
+opencode_v2 = { path = "../opencode_v2" }
 clap = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -19,3 +20,6 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
 anyhow = "1"
+sha2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
