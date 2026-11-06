@@ -9,3 +9,5 @@ central/runtime.sqlite*
 logs/
 evidence/**/probe/
 target/
+fixture/
+fixture.git/
