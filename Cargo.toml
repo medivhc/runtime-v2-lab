@@ -5,6 +5,7 @@ members = [
     "crates/store",
     "crates/service",
     "crates/runtime",
+    "crates/opencode_v2",
 ]
 
 [workspace.package]
