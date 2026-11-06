@@ -1,0 +1,21 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "runtime"
+path = "src/main.rs"
+
+[dependencies]
+domain = { path = "../domain" }
+store = { path = "../store" }
+service = { path = "../service" }
+clap = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+reqwest = { workspace = true }
+anyhow = "1"
