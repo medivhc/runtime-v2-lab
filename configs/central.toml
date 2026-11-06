@@ -1,0 +1,27 @@
+# central.toml — Runtime 中心配置（绝对路径以实际生成为准）
+listen = "127.0.0.1:8080"
+database = "/root/workspace/runtime-v2-lab/central/runtime.sqlite"
+evidence_root = "/root/workspace/runtime-v2-lab/central/evidence"
+operator_token_env = "RUNTIME_OPERATOR_TOKEN"
+planner_node = "control"
+offline_after_seconds = 15
+lease_seconds = 30
+
+[nodes.control]
+role = "control"
+capabilities = ["review"]
+token_env = "RUNTIME_CONTROL_TOKEN"
+
+[nodes.worker-a]
+role = "worker"
+capabilities = ["fixture-exec"]
+token_env = "RUNTIME_WORKER_A_TOKEN"
+
+[nodes.worker-b]
+role = "worker"
+capabilities = ["fixture-exec", "fixture-special"]
+token_env = "RUNTIME_WORKER_B_TOKEN"
+
+[repositories.fixture]
+bare_path = "/root/workspace/runtime-v2-lab/fixture/fixture.git"
+acceptance_profiles = ["counter-v1"]
