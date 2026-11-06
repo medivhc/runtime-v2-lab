@@ -325,8 +325,20 @@ async fn claim_run(
 ) -> ApiResult<Response> {
     let subject = extract_subject(&headers, &state)?;
     if body.run_type == "review" {
-        require(&subject, Action::OperatorAction)?; // placeholder: review claims via control path
-        return Err(ApiError::invalid("review claims are created by the service on task completion"));
+        require(&subject, Action::WritePlan)?;
+        let claimed = state
+            .store
+            .claim_review(&subject.id, &subject.id)
+            .map_err(ApiError::from)?;
+        return match claimed {
+            None => Ok(StatusCode::NO_CONTENT.into_response()),
+            Some((review, execute)) => Ok(Json(json!({
+                "review": review,
+                "executed": execute,
+                "lease_generation": review.lease_generation,
+            }))
+            .into_response()),
+        };
     }
     require(&subject, Action::ClaimRun)?;
     let mut node = state
@@ -617,6 +629,77 @@ async fn download_evidence(
 // ---------- Review (control-only) ----------
 
 #[derive(Deserialize)]
+pub struct EvidenceRegisterBody {
+    pub name: String,
+    pub rel_path: String,
+    pub sha256: String,
+}
+
+/// Runner wrote evidence under evidence_root; the center verifies the hash
+/// and registers it. The subject must own the run.
+async fn register_evidence(
+    State(state): State<SharedState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<EvidenceRegisterBody>,
+) -> ApiResult<Json<Value>> {
+    let subject = extract_subject(&headers, &state)?;
+    require(&subject, Action::UpdateRun)?;
+    if body.name.contains("..") || body.rel_path.contains("..") {
+        return Err(ApiError::invalid("evidence path traversal rejected"));
+    }
+    let full = std::path::Path::new(&state.config.evidence_root).join(&body.rel_path);
+    let canonical = full
+        .canonicalize()
+        .map_err(|_| ApiError::not_found("evidence file missing"))?;
+    if !canonical.starts_with(std::path::Path::new(&state.config.evidence_root)) {
+        return Err(ApiError::invalid("evidence path traversal rejected"));
+    }
+    let bytes = tokio::fs::read(&canonical)
+        .await
+        .map_err(|_| ApiError::not_found("evidence file unreadable"))?;
+    use sha2::{Digest, Sha256};
+    let actual = hex::encode(Sha256::digest(&bytes));
+    if actual != body.sha256 {
+        return Err(ApiError::conflict("evidence hash mismatch"));
+    }
+    state
+        .store
+        .add_evidence(&run_id, &body.name, &body.rel_path, &body.sha256, &subject.id, None, None, None)
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct FinishBody {
+    pub session_id: String,
+    pub candidate_sha: String,
+}
+
+/// Worker finishes an execute run; the center moves the task to
+/// awaiting_review and queues the review run for the planner node.
+async fn finish_run(
+    State(state): State<SharedState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<FinishBody>,
+) -> ApiResult<Json<Value>> {
+    let subject = extract_subject(&headers, &state)?;
+    require(&subject, Action::UpdateRun)?;
+    let review_id = state
+        .store
+        .finish_execute_and_queue_review(
+            &run_id,
+            &body.session_id,
+            &body.candidate_sha,
+            &state.config.planner_node,
+            &subject.id,
+        )
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "review_run_id": review_id })))
+}
+
+#[derive(Deserialize)]
 pub struct ReviewBody {
     pub reviewed_run_id: String,
     pub candidate_sha: String,
@@ -669,6 +752,8 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/v1/resources", get(list_resources))
         .route("/v1/resources/:id/observation", put(observe_resource))
         .route("/v1/runs/:id/evidence/:name", get(download_evidence))
+        .route("/v1/runs/:id/evidence", post(register_evidence))
+        .route("/v1/runs/:id/finish", post(finish_run))
         .route("/v1/reviews/:run_id", post(submit_review))
         .with_state(state)
 }

@@ -1351,6 +1351,126 @@ impl Store {
 
     // ---------- Messages ----------
 
+    /// Finish an execute run: advance the run to `finished`, move the task to
+    /// `awaiting_review`, and create the review run owned by the planner node.
+    /// The candidate SHA is bound here; reviews later must match it.
+    pub fn finish_execute_and_queue_review(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        candidate_sha: &str,
+        planner_node: &str,
+        subject: &str,
+    ) -> StoreResult<String> {
+        let mut conn_mut = self.conn.0.borrow_mut();
+        let tx = conn_mut.transaction()?;
+        // Guard: run must exist and be an execute run still active.
+        let (run_task, run_node, gen, state_str): (String, String, i64, String) = tx.query_row(
+            "SELECT task_id, node_id, lease_generation, state FROM runs
+             WHERE run_id=?1 AND run_type='execute'",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
+        let lease_expires: Option<i64> = tx
+            .query_row("SELECT lease_expires_at FROM runs WHERE run_id=?1", params![run_id], |r| r.get(0))?;
+        let expired = lease_expires.map(|t| t < Self::now()).unwrap_or(true);
+        // Only the lease holder (the run's own node) may finish it, with a
+        // matching generation; expired holders get a conflict.
+        domain::sched::lease_write_allowed(&run_node, gen, &run_node, gen, expired)
+            .map_err(|e| StoreError::Conflict(e.to_string()))?;
+        let from: RunState = serde_json::from_value(json!(state_str))
+            .map_err(|_| StoreError::Invalid(format!("bad run state {state_str}")))?;
+        run_transition(from, RunState::Finished)?;
+
+        tx.execute(
+            "UPDATE runs SET state='finished', session_id=COALESCE(?2, session_id),
+                candidate_sha=COALESCE(?3, candidate_sha) WHERE run_id=?1",
+            params![run_id, session_id, candidate_sha],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET state='awaiting_review' WHERE task_id=?1 AND state='running'",
+            params![run_task],
+        )?;
+        Self::append_event_tx(
+            &tx,
+            run_id,
+            "run.finished",
+            subject,
+            &json!({"session_id": session_id, "candidate_sha": candidate_sha}),
+        )?;
+
+        // Create the review run for the planner (control) node.
+        let review_id = RunId::generate();
+        let lease_expires = Self::now() + 30;
+        tx.execute(
+            "INSERT INTO runs (run_id, task_id, run_type, attempt, node_id,
+                lease_generation, lease_expires_at, state)
+             VALUES (?1, ?2, 'review',
+                COALESCE((SELECT MAX(attempt)+1 FROM runs WHERE task_id=?2 AND run_type='review'), 1),
+                ?3, 1, ?4, 'leased')",
+            params![review_id.as_str(), run_task, planner_node, lease_expires],
+        )?;
+        Self::append_event_tx(
+            &tx,
+            review_id.as_str(),
+            "review.queued",
+            subject,
+            &json!({"reviewed_run": run_id, "candidate_sha": candidate_sha}),
+        )?;
+        tx.commit()?;
+        Ok(review_id.as_str().to_string())
+    }
+
+    /// Control node claims the oldest queued review run assigned to it.
+    /// Returns the review run plus the reviewed execute run and candidate SHA.
+    pub fn claim_review(&self, planner_node: &str, subject: &str) -> StoreResult<Option<(RunRow, RunRow)>> {
+        let mut conn_mut = self.conn.0.borrow_mut();
+        let tx = conn_mut.transaction()?;
+        let review: Option<RunRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT run_id, task_id, run_type, attempt, node_id, lease_generation,
+                        lease_expires_at, candidate_sha, state FROM runs
+                 WHERE run_type='review' AND state='leased' AND node_id=?1
+                 ORDER BY run_id LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(params![planner_node], map_run)?;
+            match rows.next() {
+                Some(r) => Some(r?),
+                None => None,
+            }
+        };
+        let Some(review) = review else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let execute: RunRow = tx
+            .query_row(
+                "SELECT run_id, task_id, run_type, attempt, node_id, lease_generation,
+                        lease_expires_at, candidate_sha, state FROM runs
+                 WHERE task_id=?1 AND run_type='execute' AND candidate_sha IS NOT NULL
+                 ORDER BY run_id DESC LIMIT 1",
+                params![review.task_id],
+                map_run,
+            )
+            .map_err(|_| StoreError::NotFound("reviewed execute run missing".into()))?;
+        tx.execute(
+            "UPDATE runs SET state='running' WHERE run_id=?1",
+            params![review.run_id],
+        )?;
+        Self::append_event_tx(
+            &tx,
+            &review.run_id,
+            "review.claimed",
+            subject,
+            &json!({"reviewed_run": execute.run_id, "candidate_sha": execute.candidate_sha}),
+        )?;
+        tx.commit()?;
+        Ok(Some((review, execute)))
+    }
+
+
     pub fn create_message(
         &self,
         message_id: &MessageId,
