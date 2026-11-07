@@ -1,0 +1,20 @@
+From 04e3eaafac4e6ccf93b6c4b3b9767d0754226969 Mon Sep 17 00:00:00 2001
+From: Agent <agent@example.com>
+Date: Sat, 7 Nov 2026 20:53:09 +0800
+Subject: [PATCH] Fix increment to return value + 1
+
+---
+ counter.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/counter.py b/counter.py
+index d202578..9cc9fc9 100644
+--- a/counter.py
++++ b/counter.py
+@@ -1,2 +1,2 @@
+ def increment(value):
+-    return value
++    return value + 1
+-- 
+2.43.0
+

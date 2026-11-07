@@ -1464,8 +1464,11 @@ impl Store {
             )
             .map_err(|_| StoreError::NotFound("reviewed execute run missing".into()))?;
         tx.execute(
-            "UPDATE runs SET state='running' WHERE run_id=?1",
-            params![review.run_id],
+            // The review round includes a full model wait (up to 900 s);
+            // grant a long lease up front so the terminal advance after
+            // submission cannot fail on an expired lease.
+            "UPDATE runs SET state='running', lease_expires_at=?2 WHERE run_id=?1",
+            params![review.run_id, Self::now() + 1800],
         )?;
         Self::append_event_tx(
             &tx,

@@ -214,12 +214,15 @@ impl Runner {
     ) -> anyhow::Result<Vec<opencode_v2::MessageRow>> {
         let deadline = Instant::now() + timeout;
         let mut last_renew = Instant::now();
+        // Phase 1: wait for the expected assistant text. Phase 2: opencode
+        // emits a type=="idle" message only when the model round is truly
+        // over; assistant parts (reasoning) can appear while it is still
+        // working, so the wait must not return before the idle marker.
         loop {
             let history = self.oc.history(session_id, 100).await?;
-            for m in &history {
-                if m.kind == "assistant" && m.contains_text(expected_text) {
-                    return Ok(history);
-                }
+            let matched = history.iter().any(|m| m.kind == "assistant" && m.contains_text(expected_text));
+            if matched && history.iter().any(|m| m.kind == "idle") {
+                return Ok(history);
             }
             if Instant::now() > deadline {
                 bail!(
@@ -294,7 +297,15 @@ impl Runner {
                             }
                         }
                     }
-                    let (status, v) = self.api_post("/v1/runs/claim", &json!({"run_type": "execute"})).await?;
+                    // A stale pooled connection or a restarting center must
+                    // not kill the worker loop; log and retry next poll.
+                    let (status, v) = match self.api_post("/v1/runs/claim", &json!({"run_type": "execute"})).await {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            eprintln!("[worker-{}] claim request failed, retrying: {e}", self.cfg.node_id);
+                            continue;
+                        }
+                    };
                     if status == 204 {
                         continue;
                     }
@@ -617,6 +628,14 @@ impl Runner {
             let (status, v) = self
                 .api_put(&format!("/v1/requests/{request_id}/plan"), &plan)
                 .await?;
+            if status != 200 && v["message"].as_str().map(|m| m.contains("not in planning state")).unwrap_or(false) {
+                // Already planned (duplicate redelivery): ack and move on
+                // instead of stalling the inbox behind a doomed submit.
+                eprintln!("[control] plan for {request_id} already submitted; acking stale message");
+                let _ = self.api_post(&format!("/v1/messages/{mid}/ack"), &json!({})).await;
+                *after_cursor = mid;
+                continue;
+            }
             anyhow::ensure!(status == 200, "plan submit {request_id}: {status} {v}");
             let _ = self.api_post(&format!("/v1/messages/{mid}/ack"), &json!({})).await;
             eprintln!("[control] plan submitted for {request_id}");
@@ -776,8 +795,12 @@ impl Runner {
         self.oc.prompt(planner_session, &result_mid, &result_text).await?;
         let _ = self.oc.wait_for_reply(planner_session, &result_id, Duration::from_secs(600)).await;
 
-        // Review run → finished.
-        let _ = self.advance(&review_run, gen, "finished", Some(&review_session.id), Some(&candidate_sha)).await;
+        // Review run → finished. A silent failure here strands the review run
+        // in an active state and later blocks retry review inserts (unique
+        // active-review constraint), so surface it.
+        if let Err(e) = self.advance(&review_run, gen, "finished", Some(&review_session.id), Some(&candidate_sha)).await {
+            eprintln!("[control] review run finish failed: {e}");
+        }
         eprintln!("[control] review {review_run} submitted: {final_verdict}");
         Ok(())
     }

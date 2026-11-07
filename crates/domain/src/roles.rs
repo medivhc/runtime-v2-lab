@@ -39,8 +39,12 @@ pub fn authorized(role: Role, action: Action) -> bool {
         (Operator, OperatorAction)
         | (Operator, ReadResource) => true,
         // Control writes plans, reviews, bindings; acks own messages.
+        // UpdateRun covers advancing its own claimed review runs to their
+        // terminal state after submission (control owns review runs).
         (Control, WritePlan)
         | (Control, SubmitReview)
+        | (Control, ClaimRun)
+        | (Control, UpdateRun)
         | (Control, AckMessage)
         | (Control, ReadResource) => true,
         // Workers claim execution work, update their own runs, read
@@ -71,8 +75,10 @@ mod tests {
         assert!(authorized(Role::Control, Action::WritePlan));
         assert!(authorized(Role::Control, Action::SubmitReview));
         assert!(authorized(Role::Control, Action::AckMessage));
-        assert!(!authorized(Role::Control, Action::ClaimRun));
-        assert!(!authorized(Role::Control, Action::UpdateRun));
+        // Control may advance its own review runs (execute/review claim +
+        // terminal transitions), but execute claims remain worker-only.
+        assert!(authorized(Role::Control, Action::ClaimRun));
+        assert!(authorized(Role::Control, Action::UpdateRun));
     }
 
     #[test]
