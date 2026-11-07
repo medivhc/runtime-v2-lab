@@ -1,0 +1,14 @@
+test_increment (test_counter.CounterTest.test_increment) ... FAIL
+
+======================================================================
+FAIL: test_increment (test_counter.CounterTest.test_increment)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/root/workspace/runtime-v2-lab/evidence/m1/v03/base/test_counter.py", line 7, in test_increment
+    self.assertEqual(increment(value), value + 1)
+AssertionError: -1 != 0
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+FAILED (failures=1)

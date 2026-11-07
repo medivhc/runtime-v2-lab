@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context as _};
 use opencode_v2::OcClient;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct RunnerConfig {
     pub node_id: String,
@@ -194,6 +194,42 @@ impl Runner {
         Ok(())
     }
 
+    /// Poll the session history until an assistant message contains
+    /// `expected_text` (any assistant message when empty), renewing the run
+    /// lease every minute so long model rounds keep ownership. Total wait is
+    /// capped at `timeout`.
+    async fn wait_with_renew(
+        &self,
+        session_id: &str,
+        expected_text: &str,
+        timeout: Duration,
+        run_id: &str,
+        gen: i64,
+    ) -> anyhow::Result<Vec<opencode_v2::MessageRow>> {
+        let deadline = Instant::now() + timeout;
+        let mut last_renew = Instant::now();
+        loop {
+            let history = self.oc.history(session_id, 100).await?;
+            for m in &history {
+                if m.kind == "assistant" && m.contains_text(expected_text) {
+                    return Ok(history);
+                }
+            }
+            if Instant::now() > deadline {
+                bail!(
+                    "model round timeout after {timeout:?}: no assistant text containing {expected_text:?}"
+                );
+            }
+            if last_renew.elapsed() >= Duration::from_secs(60) {
+                if let Err(e) = self.renew(run_id, gen).await {
+                    eprintln!("[{}] lease renew while waiting: {e}", self.cfg.node_id);
+                }
+                last_renew = Instant::now();
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     fn bare_path(&self, repo_ref: &str) -> anyhow::Result<String> {
         self.cfg
             .repos
@@ -239,7 +275,16 @@ impl Runner {
                         if matches!(st.phase.as_str(), "prompt" | "running" | "finishing") {
                             eprintln!("[worker-{}] resuming run {} at phase {}", self.cfg.node_id, st.run_id, st.phase);
                             if let Err(e) = self.worker_execute(&st.task_id, &st.run_id, st.request_text.as_deref().unwrap_or("")).await {
-                                eprintln!("[worker-{}] resume failed: {e}", self.cfg.node_id);
+                                eprintln!("[worker-{}] resume failed: {e:?}", self.cfg.node_id);
+                                // A terminal run (failed/canceled on the center)
+                                // can no longer advance; drop the stale local
+                                // state so the loop returns to normal claiming.
+                                if e.to_string().contains("illegal transition")
+                                    || e.to_string().contains("not found")
+                                    || e.to_string().contains("lease_expired")
+                                {
+                                    self.clear_state();
+                                }
                             }
                         }
                     }
@@ -258,7 +303,7 @@ impl Runner {
                     let repo_ref = v["task"]["repo_ref"].as_str().unwrap_or_default().to_string();
                     eprintln!("[worker-{}] claimed task {task_id} run {run_id}", self.cfg.node_id);
                     if let Err(e) = self.worker_execute(&task_id, &run_id, &objective).await {
-                        eprintln!("[worker-{}] execute error: {e}", self.cfg.node_id);
+                        eprintln!("[worker-{}] execute error: {e:?}", self.cfg.node_id);
                         let _ = self.advance(&run_id, v["run"]["lease_generation"].as_i64().unwrap_or(1), "failed", None, None).await;
                     }
                     let _ = deliverable;
@@ -285,33 +330,55 @@ impl Runner {
 
         // Session bound (create or reuse).
         let st_session = self.load_state();
-        let session_id = match st_session.as_ref().and_then(|s| s.session_id.clone()) {
-            Some(sid) if st_session.as_ref().unwrap().run_id == run_id => {
-                // Reuse: verify session exists on this node.
-                match self.oc.get_session(&sid).await? {
-                    Some(_) => sid,
-                    None => self.create_session_for_run(&checkout, run_id).await?,
+        let same_run = st_session
+            .as_ref()
+            .map(|s| s.run_id == run_id)
+            .unwrap_or(false);
+        let session_id = if same_run {
+            match st_session.as_ref().and_then(|s| s.session_id.clone()) {
+                Some(sid) => {
+                    // Reuse: verify session exists on this node.
+                    match self.oc.get_session(&sid).await? {
+                        Some(_) => sid,
+                        None => self.create_session_for_run(&checkout, run_id).await?,
+                    }
                 }
+                None => self.create_session_for_run(&checkout, run_id).await?,
             }
-            _ => self.create_session_for_run(&checkout, run_id).await?,
+        } else {
+            self.create_session_for_run(&checkout, run_id).await?
         };
         self.advance(run_id, gen, "session_bound", Some(&session_id), None).await?;
 
-        // Persist before prompt (durability).
-        let message_id = st_session
-            .as_ref()
-            .and_then(|s| s.message_id.clone())
-            .unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4().simple()));
-        let request_text = st_session
-            .as_ref()
-            .and_then(|s| s.request_text.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "任务目标：{objective}\n\n工作目录：{}\n仓库基线：{baseline}\n交付要求：只修改完成任务所需的最少文件，\
-                     完成后无需其他动作。如果你修改了文件，请用 git commit 提交，提交说明写清改动内容。",
-                    checkout.display()
-                )
-            });
+        // Persist before prompt (durability). A prior attempt's message ID is
+        // durable on the node and must never leak into another run's session
+        // (opencode rejects a repeated prompt ID across sessions with 409).
+        let message_id = if same_run {
+            st_session
+                .as_ref()
+                .and_then(|s| s.message_id.clone())
+                .unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4().simple()))
+        } else {
+            format!("msg_{}", uuid::Uuid::new_v4().simple())
+        };
+        let request_text = if same_run {
+            st_session
+                .as_ref()
+                .and_then(|s| s.request_text.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "任务目标：{objective}\n\n工作目录：{}\n仓库基线：{baseline}\n交付要求：只修改完成任务所需的最少文件，\
+                         完成后无需其他动作。如果你修改了文件，请用 git commit 提交，提交说明写清改动内容。",
+                        checkout.display()
+                    )
+                })
+        } else {
+            format!(
+                "任务目标：{objective}\n\n工作目录：{}\n仓库基线：{baseline}\n交付要求：只修改完成任务所需的最少文件，\
+                 完成后无需其他动作。如果你修改了文件，请用 git commit 提交，提交说明写清改动内容。",
+                checkout.display()
+            )
+        };
         self.save_state(&RunState {
             run_id: run_id.to_string(),
             task_id: task_id.to_string(),
@@ -329,10 +396,13 @@ impl Runner {
         self.advance(run_id, gen, "prompt_admitted", Some(&session_id), None).await?;
 
         // Wait for the model round; the assistant reply marks activity.
-        self.oc
-            .wait_for_reply(&session_id, "", Duration::from_secs(600))
+        // Long model rounds outlive the original lease, so renew it
+        // periodically while polling history.
+        let hist = self
+            .wait_with_renew(&session_id, "", Duration::from_secs(1800), run_id, gen)
             .await
             .context("model round")?;
+        let _ = hist;
         self.advance(run_id, gen, "running", Some(&session_id), None).await?;
 
         // Commit any changes.
@@ -592,8 +662,7 @@ impl Runner {
         let stable_mid = format!("msg_rev_{}", review_run.replace(|c: char| !c.is_ascii_alphanumeric(), ""));
         self.oc.prompt(&review_session.id, &stable_mid, &verdict_prompt).await?;
         let hist = self
-            .oc
-            .wait_for_reply(&review_session.id, "verdict", Duration::from_secs(300))
+            .wait_with_renew(&review_session.id, "verdict", Duration::from_secs(900), &review_run, gen)
             .await
             .context("review agent round")?;
         let reply = hist
@@ -644,7 +713,7 @@ impl Runner {
         );
         let result_mid = format!("msg_result_{}", review_run.replace(|c: char| !c.is_ascii_alphanumeric(), ""));
         self.oc.prompt(planner_session, &result_mid, &result_text).await?;
-        let _ = self.oc.wait_for_reply(planner_session, &result_id, Duration::from_secs(120)).await;
+        let _ = self.oc.wait_for_reply(planner_session, &result_id, Duration::from_secs(600)).await;
 
         // Review run → finished.
         let _ = self.advance(&review_run, gen, "finished", Some(&review_session.id), Some(&candidate_sha)).await;
@@ -656,8 +725,33 @@ impl Runner {
 // ---------- git helpers ----------
 
 fn checkout_root(dir: &Path, bare: &str, sha: &str) -> anyhow::Result<()> {
-    if dir.exists() {
-        std::fs::remove_dir_all(dir)?;
+    // Pin GIT_DIR/GIT_WORK_TREE so git never discovers an enclosing repository
+    // (the lab workspace itself is a git repo; a walk-up would be destructive).
+    let dot_git = dir.join(".git");
+    let git_in = |args: &[&str]| -> anyhow::Result<()> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .env("GIT_DIR", &dot_git)
+            .env("GIT_WORK_TREE", dir)
+            .output()
+            .map_err(|e| anyhow!("git {args:?}: {e}"))?;
+        if !out.status.success() {
+            bail!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(())
+    };
+    if dir.join(".git").exists() {
+        // Reuse the existing checkout: the NFS-backed workspace keeps .nfs
+        // silly-renames for recently closed pack files, so remove_dir_all can
+        // fail with EBUSY. Re-sync in place instead of re-cloning.
+        git_in(&["fetch", bare,
+                 "+refs/heads/*:refs/remotes/origin/*",
+                 "+refs/runs/*:refs/remotes/origin/runs/*",
+                 "--prune"])?;
+        git_in(&["checkout", "--detach", "--force", sha])?;
+        git_in(&["reset", "--hard", sha])?;
+        git_in(&["clean", "-fdx"])?;
+        return Ok(());
     }
     std::fs::create_dir_all(dir)?;
     let run = |args: &[&str]| -> anyhow::Result<()> {
@@ -680,9 +774,21 @@ fn checkout_root(dir: &Path, bare: &str, sha: &str) -> anyhow::Result<()> {
     if !st.status.success() {
         bail!("clone failed: {}", String::from_utf8_lossy(&st.stderr));
     }
+    // Clone only carries refs/heads; run refs (refs/runs/*) must be fetched
+    // explicitly so candidate checkouts can resolve their SHAs.
+    let st = std::process::Command::new("git")
+        .args(["fetch", bare, "+refs/runs/*:refs/remotes/origin/runs/*"])
+        .current_dir(dir)
+        .env("GIT_DIR", &dot_git)
+        .output()
+        .context("git fetch runs")?;
+    if !st.status.success() {
+        bail!("fetch runs failed: {}", String::from_utf8_lossy(&st.stderr));
+    }
     let st = std::process::Command::new("git")
         .args(["checkout", "--detach", sha])
-        .current_dir(dir)
+        .env("GIT_DIR", &dot_git)
+        .env("GIT_WORK_TREE", dir)
         .output()
         .context("checkout sha")?;
     if !st.status.success() {

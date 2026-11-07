@@ -1,0 +1,6 @@
+test_increment (test_counter.CounterTest.test_increment) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+OK

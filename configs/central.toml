@@ -4,8 +4,8 @@ database = "/root/workspace/runtime-v2-lab/central/runtime.sqlite"
 evidence_root = "/root/workspace/runtime-v2-lab/central/evidence"
 operator_token_env = "RUNTIME_OPERATOR_TOKEN"
 planner_node = "control"
-offline_after_seconds = 15
-lease_seconds = 30
+offline_after_seconds = 60
+lease_seconds = 300
 
 [nodes.control]
 role = "control"

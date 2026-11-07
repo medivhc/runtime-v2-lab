@@ -1438,8 +1438,8 @@ impl Store {
         let tx = conn_mut.transaction()?;
         let review: Option<RunRow> = {
             let mut stmt = tx.prepare(
-                "SELECT run_id, task_id, run_type, attempt, node_id, lease_generation,
-                        lease_expires_at, candidate_sha, state FROM runs
+                "SELECT run_id, task_id, run_type, attempt, node_id, session_id,
+                        lease_generation, lease_expires_at, candidate_sha, state FROM runs
                  WHERE run_type='review' AND state='leased' AND node_id=?1
                  ORDER BY run_id LIMIT 1",
             )?;
@@ -1455,8 +1455,8 @@ impl Store {
         };
         let execute: RunRow = tx
             .query_row(
-                "SELECT run_id, task_id, run_type, attempt, node_id, lease_generation,
-                        lease_expires_at, candidate_sha, state FROM runs
+                "SELECT run_id, task_id, run_type, attempt, node_id, session_id,
+                        lease_generation, lease_expires_at, candidate_sha, state FROM runs
                  WHERE task_id=?1 AND run_type='execute' AND candidate_sha IS NOT NULL
                  ORDER BY run_id DESC LIMIT 1",
                 params![review.task_id],
