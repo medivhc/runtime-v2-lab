@@ -1,0 +1,15 @@
+node_id = "worker-b"
+role = "worker"
+capabilities = ["fixture-exec", "fixture-special"]
+capacity = 1
+runtime_url = "http://127.0.0.1:18080"
+runtime_token_env = "RUNTIME_WORKER_B_TOKEN"
+opencode_url = "http://127.0.0.1:4098"
+opencode_password_env = "OC_WORKER_B_PASSWORD"
+runner_dir = "/root/workspace/runtime-v2-lab/worker-b/runner"
+work_root = "/root/workspace/runtime-v2-lab/worker-b/work"
+poll_seconds = 2
+heartbeat_seconds = 5
+
+[repositories]
+fixture = "/root/workspace/runtime-v2-lab/fixture.git"

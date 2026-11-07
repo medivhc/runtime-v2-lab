@@ -26,6 +26,10 @@ pub struct RunnerConfig {
     pub repos: Vec<(String, String)>, // (repo_ref, bare_path)
     /// planner_node as configured centrally (control only)
     pub planner_node: String,
+    /// Test-only pause points (spec M2/V05, V06). Disabled unless the
+    /// explicit test config flag is present.
+    pub test_pause_after_prompt: bool,
+    pub test_pause_before_result: bool,
 }
 
 impl RunnerConfig {
@@ -64,7 +68,9 @@ impl RunnerConfig {
             }
         }
         let planner_node = "control".to_string();
-        Ok(Self { node_id, role, capabilities, runtime_url, token, opencode_url, opencode_password, runner_dir: runner_dir.into(), work_root: work_root.into(), poll_seconds, heartbeat_seconds, repos, planner_node })
+        let test_pause_after_prompt = v.get("test_pause_after_prompt").and_then(|x| x.as_bool()).unwrap_or(false);
+        let test_pause_before_result = v.get("test_pause_before_result").and_then(|x| x.as_bool()).unwrap_or(false);
+        Ok(Self { node_id, role, capabilities, runtime_url, token, opencode_url, opencode_password, runner_dir: runner_dir.into(), work_root: work_root.into(), poll_seconds, heartbeat_seconds, repos, planner_node, test_pause_after_prompt, test_pause_before_result })
     }
 }
 
@@ -348,7 +354,11 @@ impl Runner {
         } else {
             self.create_session_for_run(&checkout, run_id).await?
         };
-        self.advance(run_id, gen, "session_bound", Some(&session_id), None).await?;
+        if let Err(e) = self.advance(run_id, gen, "session_bound", Some(&session_id), None).await {
+            // Resumed runs are already session_bound; tolerate that and let
+            // the next advance catch any real lease problem.
+            eprintln!("[worker-{}] session_bound advance tolerated: {e}", self.cfg.node_id);
+        }
 
         // Persist before prompt (durability). A prior attempt's message ID is
         // durable on the node and must never leak into another run's session
@@ -393,6 +403,22 @@ impl Runner {
             .prompt(&session_id, &message_id, &request_text)
             .await
             .context("prompt delivery")?;
+        // V05 test pause point: the prompt is accepted by the V2 server but
+        // the center has not yet recorded `prompt_admitted`. Terminate the
+        // runner here; the restart must resume with the same run/session/
+        // message ID and the session must hold only one corresponding input.
+        if self.cfg.test_pause_after_prompt {
+            self.save_state(&RunState {
+                run_id: run_id.to_string(),
+                task_id: task_id.to_string(),
+                session_id: Some(session_id.clone()),
+                message_id: Some(message_id.clone()),
+                request_text: Some(request_text.clone()),
+                phase: "prompt".into(),
+            });
+            eprintln!("[worker-{}] TEST-PAUSE after prompt delivery (run {run_id}); exiting", self.cfg.node_id);
+            std::process::exit(0);
+        }
         self.advance(run_id, gen, "prompt_admitted", Some(&session_id), None).await?;
 
         // Wait for the model round; the assistant reply marks activity.
@@ -508,6 +534,27 @@ impl Runner {
             .await?;
         anyhow::ensure!(status == 200, "planner binding: {status} {v}");
         eprintln!("[control] planner session bound: {planner_session}");
+
+        // V06 restart recovery: a pending result paused before delivery is
+        // flushed exactly once here (the stable message ID keeps the planner
+        // session free of duplicates even if this code runs repeatedly).
+        let pending_path = self.cfg.runner_dir.join("pending_result.json");
+        if let Ok(raw) = std::fs::read(&pending_path) {
+            if let Ok(p) = serde_json::from_slice::<Value>(&raw) {
+                let (sid, mid, text) = (
+                    p["planner_session"].as_str().unwrap_or_default().to_string(),
+                    p["result_mid"].as_str().unwrap_or_default().to_string(),
+                    p["result_text"].as_str().unwrap_or_default().to_string(),
+                );
+                match self.oc.prompt(&sid, &mid, &text).await {
+                    Ok(_) => {
+                        eprintln!("[control] pending result {mid} delivered to planner session");
+                        let _ = std::fs::remove_file(&pending_path);
+                    }
+                    Err(e) => eprintln!("[control] pending result delivery failed: {e}"),
+                }
+            }
+        }
 
         let mut after_cursor = String::new();
         loop {
@@ -707,11 +754,25 @@ impl Runner {
         let final_verdict = v["final_verdict"].as_str().unwrap_or("fail").to_string();
 
         // Deliver result to planner session and require echo of result ID.
+        // V06 test pause point: stop the delivery loop before the result
+        // reaches the planner session, persisting it for restart recovery.
         let result_id = format!("result_{review_run}");
         let result_text = format!(
             "任务 {task_id} 验收完成：{final_verdict}。候选 {candidate_sha}，固定测试退出码 {fixed_exit}，结果 ID {result_id}。请只回复该结果 ID 以确认收到。"
         );
         let result_mid = format!("msg_result_{}", review_run.replace(|c: char| !c.is_ascii_alphanumeric(), ""));
+        if self.cfg.test_pause_before_result {
+            let pending = self.cfg.runner_dir.join("pending_result.json");
+            std::fs::create_dir_all(&self.cfg.runner_dir)?;
+            std::fs::write(&pending, json!({
+                "planner_session": planner_session,
+                "result_mid": result_mid,
+                "result_id": result_id,
+                "result_text": result_text,
+            }).to_string())?;
+            eprintln!("[control] TEST-PAUSE before result delivery (run {review_run}); exiting");
+            std::process::exit(0);
+        }
         self.oc.prompt(planner_session, &result_mid, &result_text).await?;
         let _ = self.oc.wait_for_reply(planner_session, &result_id, Duration::from_secs(600)).await;
 

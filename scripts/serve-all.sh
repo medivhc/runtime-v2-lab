@@ -19,6 +19,8 @@ start_missing() {
     (cd $LAB && setsid nohup $LAB/target/debug/runtime runner --config $LAB/configs/control.toml >> $LAB/logs/control-runner.log 2>&1 &)
   pgrep -f "runtime runner --config .*worker-a.toml" >/dev/null || \
     (cd $LAB && setsid nohup $LAB/target/debug/runtime runner --config $LAB/configs/worker-a.toml >> $LAB/logs/worker-a-runner.log 2>&1 &)
+  pgrep -f "runtime runner --config .*worker-b.toml" >/dev/null || \
+    (cd $LAB && setsid nohup $LAB/target/debug/runtime runner --config $LAB/configs/worker-b.toml >> $LAB/logs/worker-b-runner.log 2>&1 &)
 }
 
 start_missing
