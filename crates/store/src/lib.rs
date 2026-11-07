@@ -262,6 +262,9 @@ impl Store {
 
     pub fn open(path: &str) -> StoreResult<Store> {
         let conn = Connection::open(path)?;
+        // Concurrent writers (multi-connection tests, operator CLI inspection)
+        // must wait for the write lock instead of failing with SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         let s = Store { conn: refcell::RefCellConn(std::cell::RefCell::new(conn)) };
         s.migrate()?;
         Ok(s)
@@ -908,7 +911,11 @@ impl Store {
         subject: &str,
     ) -> StoreResult<Option<(TaskRow, RunRow)>> {
         let mut conn_mut = self.conn.0.borrow_mut();
-        let tx = conn_mut.transaction()?;
+        // BEGIN IMMEDIATE: acquire the write lock upfront so that concurrent
+        // claimers serialize (upgrade-deadlock would otherwise return
+        // SQLITE_BUSY immediately, bypassing busy_timeout).
+        let tx = conn_mut
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Refresh active run counts for this node.
         let active: i64 = tx.query_row(
             "SELECT COUNT(*) FROM runs r JOIN nodes n ON r.node_id = n.node_id
