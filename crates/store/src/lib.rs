@@ -229,33 +229,35 @@ impl Store {
     pub fn execute_raw_sql(&self, sql: &str, params: &[&str]) -> StoreResult<usize> {
         use rusqlite::ToSql;
         let mapped: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
-        Ok(self.conn.0.borrow_mut().execute(sql, mapped.as_slice())?)
+        Ok(self.conn.borrow_mut().execute(sql, mapped.as_slice())?)
     }
 }
 
 /// Minimal interior-mutability wrapper so `&Store` can open transactions
 /// (rusqlite Transaction needs &mut Connection; the service shares the
-/// store through Arc, so we use a RefCell with explicit borrow discipline).
+/// store through Arc). A blocking Mutex, not a RefCell: concurrent request
+/// handlers must serialize on the single connection instead of panicking
+/// with "RefCell already borrowed" when two writes overlap.
 pub mod refcell {
     use rusqlite::Connection;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
     #[derive(Debug)]
-    pub struct RefCellConn(pub std::cell::RefCell<Connection>);
-    impl std::ops::Deref for RefCellConn {
-        type Target = RefCell<Connection>;
-        fn deref(&self) -> &RefCell<Connection> {
-            &self.0
+    pub struct RefCellConn(pub Mutex<Connection>);
+    impl RefCellConn {
+        pub fn borrow_mut(&self) -> std::sync::MutexGuard<'_, Connection> {
+            self.0.lock().unwrap_or_else(|p| p.into_inner())
+        }
+        pub fn borrow(&self) -> std::sync::MutexGuard<'_, Connection> {
+            self.borrow_mut()
         }
     }
-    unsafe impl Send for RefCellConn {}
-    unsafe impl Sync for RefCellConn {}
 }
 
 impl Store {
     /// In-memory database (for tests and ephemeral uses).
     pub fn in_memory() -> StoreResult<Store> {
         let conn = Connection::open_in_memory()?;
-        let s = Store { conn: refcell::RefCellConn(std::cell::RefCell::new(conn)) };
+        let s = Store { conn: refcell::RefCellConn(std::sync::Mutex::new(conn)) };
         s.migrate()?;
         Ok(s)
     }
@@ -265,15 +267,15 @@ impl Store {
         // Concurrent writers (multi-connection tests, operator CLI inspection)
         // must wait for the write lock instead of failing with SQLITE_BUSY.
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-        let s = Store { conn: refcell::RefCellConn(std::cell::RefCell::new(conn)) };
+        let s = Store { conn: refcell::RefCellConn(std::sync::Mutex::new(conn)) };
         s.migrate()?;
         Ok(s)
     }
 
     /// Idempotent migration with foreign keys on.
     pub fn migrate(&self) -> StoreResult<()> {
-        self.conn.0.borrow_mut().execute_batch("PRAGMA foreign_keys = ON;")?;
-        self.conn.0.borrow_mut().execute_batch(
+        self.conn.borrow_mut().execute_batch("PRAGMA foreign_keys = ON;")?;
+        self.conn.borrow_mut().execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS requests (
                 request_id TEXT PRIMARY KEY,
@@ -475,7 +477,7 @@ impl Store {
         subject: &str,
         payload: &serde_json::Value,
     ) -> StoreResult<i64> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let seq = Self::append_event_tx(&tx, entity_id, event_type, subject, payload)?;
         tx.commit()?;
@@ -483,7 +485,7 @@ impl Store {
     }
 
     pub fn list_events(&self, entity_id: &str, after: i64) -> StoreResult<Vec<EventRow>> {
-        let conn_ref = self.conn.0.borrow();
+        let conn_ref = self.conn.borrow();
         let mut stmt = conn_ref.prepare(
             "SELECT seq, entity_id, event_type, subject, payload, created_at
              FROM events WHERE entity_id = ?1 AND seq > ?2 ORDER BY seq",
@@ -503,7 +505,7 @@ impl Store {
 
     /// Global event stream cursor read.
     pub fn list_events_global(&self, after: i64, limit: i64) -> StoreResult<Vec<EventRow>> {
-        let conn_ref = self.conn.0.borrow();
+        let conn_ref = self.conn.borrow();
         let mut stmt = conn_ref.prepare(
             "SELECT seq, entity_id, event_type, subject, payload, created_at
              FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
@@ -533,7 +535,7 @@ impl Store {
         body_digest: &str,
         response: Option<&str>,
     ) -> StoreResult<Option<String>> {
-        let row: Option<(String, Option<String>)> = self.conn.0.borrow().query_row(
+        let row: Option<(String, Option<String>)> = self.conn.borrow().query_row(
                 "SELECT body_digest, response FROM idem_writes WHERE subject=?1 AND idem_key=?2",
                 params![subject, idem_key],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
@@ -545,7 +547,7 @@ impl Store {
             }
             return Ok(stored_response);
         }
-        self.conn.0.borrow_mut().execute(
+        self.conn.borrow_mut().execute(
             "INSERT OR IGNORE INTO idem_writes (subject, idem_key, body_digest, response)
              VALUES (?1, ?2, ?3, ?4)",
             params![subject, idem_key, body_digest, response],
@@ -554,7 +556,7 @@ impl Store {
     }
 
     pub fn idem_store_response(&self, subject: &str, idem_key: &str, response: &str) -> StoreResult<()> {
-        self.conn.0.borrow_mut().execute(
+        self.conn.borrow_mut().execute(
             "UPDATE idem_writes SET response=?3 WHERE subject=?1 AND idem_key=?2",
             params![subject, idem_key, response],
         )?;
@@ -573,7 +575,7 @@ impl Store {
         required_routes: &[String],
         operator: &str,
     ) -> StoreResult<()> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         tx.execute(
             "INSERT INTO requests (request_id, intent, repo_ref, baseline_sha,
@@ -631,7 +633,7 @@ impl Store {
         state: String,
         reason: Option<String>,
     ) -> StoreResult<RequestRow> {
-        let conn_ref = self.conn.0.borrow();
+        let conn_ref = self.conn.borrow();
         let mut stmt = conn_ref.prepare(
             "SELECT request_id, intent, repo_ref, baseline_sha, required_capabilities,
                     required_routes, planner_session, operator, plan_version
@@ -666,7 +668,7 @@ impl Store {
         plan: &Plan,
         submitted_by_node: Option<&str>,
     ) -> StoreResult<ValidatedPlan> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let (state, caps_json, routes_json, planner_binding): (String, String, String, Option<String>) =
             tx.query_row(
@@ -761,7 +763,7 @@ impl Store {
 
     /// Mark planning failed (blocked) with reason.
     pub fn block_request(&self, request_id: &str, reason: &str, subject: &str) -> StoreResult<()> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         request_transition(RequestState::Planning, RequestState::Blocked)?;
         tx.execute(
@@ -775,7 +777,7 @@ impl Store {
 
     /// Mark request accepted only when all its tasks are accepted.
     pub fn accept_request_if_complete(&self, request_id: &str, subject: &str) -> StoreResult<bool> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let pending: i64 = tx.query_row(
             "SELECT COUNT(*) FROM tasks WHERE request_id=?1 AND state != 'accepted'",
@@ -805,7 +807,7 @@ impl Store {
         session_id: &str,
         subject: &str,
     ) -> StoreResult<String> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let existing: Option<String> = tx
             .query_row(
@@ -838,7 +840,7 @@ impl Store {
     }
 
     pub fn get_planner_binding(&self, planner_node: &str) -> StoreResult<Option<String>> {
-        Ok(self.conn.0.borrow().query_row(
+        Ok(self.conn.borrow().query_row(
                 "SELECT session_id FROM planner_binding WHERE planner_node=?1",
                 params![planner_node],
                 |r| r.get(0),
@@ -857,7 +859,7 @@ impl Store {
         capacity: i64,
         repo_refs: &[String],
     ) -> StoreResult<()> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         tx.execute(
             "INSERT INTO nodes (node_id, role, capabilities, capacity, last_heartbeat, repo_refs)
@@ -879,7 +881,7 @@ impl Store {
     }
 
     pub fn get_node(&self, node_id: &str, offline_after_seconds: i64) -> StoreResult<Option<NodeView>> {
-        let row = self.conn.0.borrow().query_row(
+        let row = self.conn.borrow().query_row(
                 "SELECT node_id, role, capabilities, capacity, last_heartbeat, repo_refs
                  FROM nodes WHERE node_id=?1",
                 params![node_id],
@@ -910,7 +912,7 @@ impl Store {
         _node_routes: &[RouteView],
         subject: &str,
     ) -> StoreResult<Option<(TaskRow, RunRow)>> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         // BEGIN IMMEDIATE: acquire the write lock upfront so that concurrent
         // claimers serialize (upgrade-deadlock would otherwise return
         // SQLITE_BUSY immediately, bypassing busy_timeout).
@@ -1080,7 +1082,7 @@ impl Store {
         lease_seconds: i64,
         subject: &str,
     ) -> StoreResult<i64> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let (run_node, gen, state): (String, i64, String) = tx.query_row(
             "SELECT node_id, lease_generation, state FROM runs WHERE run_id=?1",
@@ -1124,7 +1126,7 @@ impl Store {
         candidate_sha: Option<&str>,
         subject: &str,
     ) -> StoreResult<()> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let (run_node, gen, state_str): (String, i64, String) = tx.query_row(
             "SELECT node_id, lease_generation, state FROM runs WHERE run_id=?1",
@@ -1173,7 +1175,7 @@ impl Store {
 
     /// Mark run uncertain (when the runner cannot confirm an outcome).
     pub fn mark_uncertain(&self, run_id: &str, reason: &str, subject: &str) -> StoreResult<()> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let state_str: String = tx
             .query_row("SELECT state FROM runs WHERE run_id=?1", params![run_id], |r| r.get(0))
@@ -1211,7 +1213,7 @@ impl Store {
         reason: &str,
         subject: &str,
     ) -> StoreResult<()> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let state_str: String = tx
             .query_row("SELECT state FROM runs WHERE run_id=?1", params![run_id], |r| r.get(0))
@@ -1255,7 +1257,7 @@ impl Store {
 
     /// Retry: re-open a task whose old run is terminal or was closed.
     pub fn retry_task(&self, task_id: &str, subject: &str) -> StoreResult<()> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let (state, _reason): (String, Option<String>) = tx.query_row(
             "SELECT state, reason FROM tasks WHERE task_id=?1",
@@ -1300,7 +1302,7 @@ impl Store {
         agent_verdict: &str,
         subject: &str,
     ) -> StoreResult<String> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         // Reviewed run must exist and be an execute run with a bound SHA.
         let (bound_sha, _exec_state): (Option<String>, String) = tx.query_row(
@@ -1377,7 +1379,7 @@ impl Store {
         planner_node: &str,
         subject: &str,
     ) -> StoreResult<String> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         // Guard: run must exist and be an execute run still active.
         let (run_task, run_node, gen, state_str): (String, String, i64, String) = tx.query_row(
@@ -1441,7 +1443,7 @@ impl Store {
     /// Control node claims the oldest queued review run assigned to it.
     /// Returns the review run plus the reviewed execute run and candidate SHA.
     pub fn claim_review(&self, planner_node: &str, subject: &str) -> StoreResult<Option<(RunRow, RunRow)>> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let review: Option<RunRow> = {
             let mut stmt = tx.prepare(
@@ -1501,7 +1503,7 @@ impl Store {
         body: &str,
         idem_key: Option<&str>,
     ) -> StoreResult<()> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         if let Some(key) = idem_key {
             let digest = Self::body_digest(body);
@@ -1566,7 +1568,7 @@ impl Store {
         to: MessageState,
         subject: &str,
     ) -> StoreResult<()> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let state: String = tx
             .query_row("SELECT state FROM messages WHERE message_id=?1", params![message_id], |r| r.get(0))
@@ -1607,7 +1609,7 @@ impl Store {
 
     /// Inbox: messages targeted at a node/session with cursor.
     pub fn inbox(&self, node_id: &str, after: &str, limit: i64) -> StoreResult<Vec<MessageRow>> {
-        let conn_ref = self.conn.0.borrow();
+        let conn_ref = self.conn.borrow();
         let mut stmt = conn_ref.prepare(
             "SELECT message_id, from_subject, target_node, target_session, request_id,
                     task_id, kind, body, state
@@ -1644,7 +1646,7 @@ impl Store {
         candidate_sha: Option<&str>,
         run_ref: Option<&str>,
     ) -> StoreResult<EvidenceId> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let id = EvidenceId::generate();
         tx.execute(
@@ -1673,7 +1675,7 @@ impl Store {
         if name.contains("..") || name.starts_with('/') {
             return Err(StoreError::Invalid("evidence path traversal rejected".into()));
         }
-        let (path, sha): (String, String) = self.conn.0.borrow().query_row(
+        let (path, sha): (String, String) = self.conn.borrow().query_row(
                 "SELECT rel_path, sha256 FROM evidence WHERE run_id=?1 AND rel_path=?2",
                 params![run_id, name],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1687,7 +1689,7 @@ impl Store {
     /// Only the owning node may request it; the center grants a new
     /// generation lease for the same run and node.
     pub fn recover_run(&self, run_id: &str, node_id: &str) -> StoreResult<()> {
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let (run_node, state_str): (String, String) = tx.query_row(
             "SELECT node_id, state FROM runs WHERE run_id=?1",
@@ -1728,7 +1730,7 @@ impl Store {
     }
 
     pub fn get_message(&self, message_id: &str) -> StoreResult<MessageRow> {
-        self.conn.0.borrow().query_row(
+        self.conn.borrow().query_row(
                 "SELECT message_id, from_subject, target_node, target_session, request_id,
                         task_id, kind, body, state
                  FROM messages WHERE message_id=?1",
@@ -1762,7 +1764,7 @@ impl Store {
         visibility: &str,
         credential_ref: Option<&str>,
     ) -> StoreResult<()> {
-        self.conn.0.borrow_mut().execute(
+        self.conn.borrow_mut().execute(
             "INSERT INTO resources (resource_id, kind, owner_node, version, visibility, credential_ref)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(resource_id) DO UPDATE SET kind=?2, owner_node=?3, version=?4,
@@ -1786,7 +1788,7 @@ impl Store {
                 "route observation must come from the source node".into(),
             )));
         }
-        let mut conn_mut = self.conn.0.borrow_mut();
+        let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         tx.execute(
             "INSERT INTO routes (resource_id, source_node, method, observed_at, valid_seconds)
@@ -1804,7 +1806,7 @@ impl Store {
     pub fn list_resources(&self, subject: &str) -> StoreResult<serde_json::Value> {
         let mut out = json!({"resources": [], "routes": []});
         {
-            let conn_ref = self.conn.0.borrow();
+            let conn_ref = self.conn.borrow();
         let mut stmt = conn_ref.prepare(
                 "SELECT resource_id, kind, owner_node, version, visibility, observed_at,
                         valid_seconds, credential_ref FROM resources",
@@ -1825,7 +1827,7 @@ impl Store {
             out["resources"] = json!(items);
         }
         if subject != "operator" {
-            let conn_ref = self.conn.0.borrow();
+            let conn_ref = self.conn.borrow();
         let mut stmt = conn_ref.prepare(
                 "SELECT resource_id, source_node, observed_at, valid_seconds FROM routes
                  WHERE source_node=?1",
@@ -1849,7 +1851,7 @@ impl Store {
     // ---------- Repo registry (for plan validation) ----------
 
     pub fn register_repo(&self, name: &str, bare_path: &str, profiles: &[String]) -> StoreResult<()> {
-        self.conn.0.borrow_mut().execute(
+        self.conn.borrow_mut().execute(
             "INSERT INTO repo_registry (name, bare_path, profiles) VALUES (?1, ?2, ?3)
              ON CONFLICT(name) DO UPDATE SET bare_path=?2, profiles=?3",
             params![name, bare_path, serde_json::to_string(profiles).unwrap()],
@@ -1860,7 +1862,7 @@ impl Store {
     // ---------- Helpers ----------
 
     pub fn get_task(&self, task_id: &str) -> StoreResult<TaskRow> {
-        let conn_ref = self.conn.0.borrow();
+        let conn_ref = self.conn.borrow();
         let mut stmt = conn_ref.prepare(
             "SELECT task_id, request_id, key, objective, deliverable, repo_ref,
                     required_capabilities, required_routes, acceptance_profile, fixed_node,
@@ -1890,7 +1892,7 @@ impl Store {
     }
 
     pub fn get_run(&self, run_id: &str) -> StoreResult<RunRow> {
-        self.conn.0.borrow().query_row(
+        self.conn.borrow().query_row(
                 "SELECT run_id, task_id, run_type, attempt, node_id, session_id,
                         lease_generation, lease_expires_at, candidate_sha, state
                  FROM runs WHERE run_id=?1",
@@ -1915,7 +1917,7 @@ impl Store {
     }
 
     pub fn runs_for_request(&self, request_id: &str) -> StoreResult<Vec<RunRow>> {
-        let conn_ref = self.conn.0.borrow();
+        let conn_ref = self.conn.borrow();
         let mut stmt = conn_ref.prepare(
             "SELECT r.run_id, r.task_id, r.run_type, r.attempt, r.node_id, r.session_id,
                     r.lease_generation, r.lease_expires_at, r.candidate_sha, r.state
@@ -1927,7 +1929,7 @@ impl Store {
     }
 
     pub fn tasks_for_request(&self, request_id: &str) -> StoreResult<Vec<TaskRow>> {
-        let conn_ref = self.conn.0.borrow();
+        let conn_ref = self.conn.borrow();
         let mut stmt = conn_ref.prepare(
             "SELECT task_id, request_id, key, objective, deliverable, repo_ref,
                     required_capabilities, required_routes, acceptance_profile, fixed_node,

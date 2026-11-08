@@ -2,7 +2,7 @@
 # serve-all.sh — 拉起中心 + 双 runner，若进程缺失自动补（由 exec setsid 常驻调用）
 set -u
 LAB=/root/workspace/runtime-v2-lab
-source $LAB/scripts/env.sh
+. $LAB/scripts/env.sh
 # 令牌以 secrets/runtime.env 为准；e2e 兜底值仅在缺失时使用。
 if [ -f $LAB/secrets/runtime.env ]; then
   set -a; . $LAB/secrets/runtime.env; set +a

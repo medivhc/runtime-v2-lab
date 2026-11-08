@@ -605,6 +605,8 @@ impl Runner {
             }
             let intent = msg["body"].as_str().unwrap_or_default().to_string();
             // Deliver to planner session with stable message ID derived from the message.
+            // A failed model round (e.g. gateway outage) leaves the queued prompt
+            // un-rerunnable under the same ID, so retries use a fresh suffixed ID.
             let stable_mid = format!("msg_plan_{}", mid.replace(|c: char| !c.is_ascii_alphanumeric(), ""));
             let plan_dir = self.cfg.runner_dir.join("plans");
             std::fs::create_dir_all(&plan_dir)?;
@@ -614,15 +616,27 @@ impl Runner {
                  请把计划写到文件 {}\n格式（严格遵守）：\n{{\n  \"request_id\": \"{request_id}\",\n  \"tasks\": [\n    {{\n      \"key\": \"任务短名\",\n      \"objective\": \"目标\",\n      \"deliverable\": \"交付物\",\n      \"repo_ref\": \"fixture\",\n      \"required_capabilities\": [\"fixture-exec\"],\n      \"acceptance_profile\": \"counter-v1\",\n      \"depends_on\": []\n    }}\n  ]\n}}\n先写临时文件再原子重命名。写完文件后回复 PLAN-WRITTEN。",
                 plan_file.display()
             );
-            self.oc.prompt(planner_session, &stable_mid, &prompt).await?;
-            // Wait for the plan file (up to 300 s), then validate and submit.
             let mut plan: Option<Value> = None;
-            for _ in 0..300 {
-                if let Ok(text) = std::fs::read_to_string(&plan_file) {
-                    plan = serde_json::from_str(&text).ok();
+            for attempt in 1..=3u32 {
+                let mid_attempt =
+                    if attempt == 1 { stable_mid.clone() } else { format!("{stable_mid}_r{attempt}") };
+                if attempt > 1 {
+                    eprintln!("[control] retrying planner prompt for {request_id} (attempt {attempt})");
+                }
+                self.oc.prompt(planner_session, &mid_attempt, &prompt).await?;
+                // Wait for the plan file (up to 300 s), then validate and submit.
+                for _ in 0..300 {
+                    if let Ok(text) = std::fs::read_to_string(&plan_file) {
+                        if let Ok(p) = serde_json::from_str::<Value>(&text) {
+                            plan = Some(p);
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                if plan.is_some() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
             }
             let plan = plan.ok_or_else(|| anyhow!("planner did not write {plan_file:?} in time"))?;
             let (status, v) = self
