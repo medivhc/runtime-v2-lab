@@ -1355,6 +1355,43 @@ impl Store {
                 params![reviewed_run_id],
             )?;
         }
+        // A passing review may complete the request: when every task of the
+        // request is accepted, mark the request accepted in the same tx.
+        if final_verdict == "pass" {
+            let request_id: String = tx.query_row(
+                "SELECT request_id FROM tasks WHERE task_id=(SELECT task_id FROM runs WHERE run_id=?1)",
+                params![reviewed_run_id],
+                |r| r.get(0),
+            )?;
+            let pending: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE request_id=?1 AND state != 'accepted'",
+                params![request_id],
+                |r| r.get(0),
+            )?;
+            if pending == 0 {
+                let active: Option<String> = tx
+                    .query_row(
+                        "SELECT request_id FROM requests WHERE request_id=?1 AND state='active'",
+                        params![request_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if active.is_some() {
+                    request_transition(RequestState::Active, RequestState::Accepted)?;
+                    tx.execute(
+                        "UPDATE requests SET state='accepted' WHERE request_id=?1 AND state='active'",
+                        params![request_id],
+                    )?;
+                    Self::append_event_tx(
+                        &tx,
+                        &request_id,
+                        "request.accepted",
+                        subject,
+                        &json!({}),
+                    )?;
+                }
+            }
+        }
         Self::append_event_tx(
             &tx,
             review_run_id,

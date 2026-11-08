@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# env.sh — runtime-v2-lab 全部进程共用的环境基线（source 本文件）
-set -euo pipefail
+# env.sh — runtime-v2-lab 全部进程共用的环境基线（source 本文件；兼容 sh/dash）
+set -eu
+(set -o pipefail) 2>/dev/null && set -o pipefail || true
 export LAB=/root/workspace/runtime-v2-lab
 export PATH="/root/workspace/.local/ccwrap:/root/workspace/.local/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:/root/workspace/.local/opencode:$PATH"
 export RUSTUP_HOME=/root/workspace/.local/rustup
