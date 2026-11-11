@@ -1,0 +1,19 @@
+# worker-a.toml / control.toml 共用格式；本文件是 worker-a 样例
+node_id = "worker-a"
+role = "worker"
+capabilities = ["fixture-exec"]
+capacity = 1
+runtime_url = "http://127.0.0.1:18080"
+runtime_token_env = "RUNTIME_WORKER_A_TOKEN"
+opencode_url = "http://127.0.0.1:4097"
+opencode_password_env = "OC_WORKER_A_PASSWORD"
+runner_dir = "/root/workspace/runtime-v2-lab/worker-a/runner"
+work_root = "/root/workspace/runtime-v2-lab/worker-a/work"
+poll_seconds = 2
+heartbeat_seconds = 5
+
+# V05: pause right after prompt delivery, before the center records prompt_admitted
+test_pause_after_prompt = true
+
+[repositories]
+fixture = "/root/workspace/runtime-v2-lab/fixture.git"

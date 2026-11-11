@@ -1,0 +1,20 @@
+From eeba742e84367b8733d499137740bd312b33aae8 Mon Sep 17 00:00:00 2001
+From: Agent <agent@example.com>
+Date: Wed, 11 Nov 2026 17:15:02 +0800
+Subject: [PATCH] Fix increment to add 1 to input value
+
+---
+ counter.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/counter.py b/counter.py
+index d202578..9cc9fc9 100644
+--- a/counter.py
++++ b/counter.py
+@@ -1,2 +1,2 @@
+ def increment(value):
+-    return value
++    return value + 1
+-- 
+2.43.0
+

@@ -1227,6 +1227,13 @@ impl Store {
                 "UPDATE runs SET state='canceled' WHERE run_id=?1",
                 params![run_id],
             )?;
+            // Closing a run must not leave its task stuck in running;
+            // mirror advance_run's failure path so the operator can retry.
+            tx.execute(
+                "UPDATE tasks SET state='canceled', reason=?2
+                 WHERE task_id=(SELECT task_id FROM runs WHERE run_id=?1) AND state='running'",
+                params![run_id, reason],
+            )?;
             Self::append_event_tx(
                 &tx,
                 run_id,

@@ -1,0 +1,21 @@
+From 400b7fc8c19bbcf9d5a237fd67d377a7566eaf20 Mon Sep 17 00:00:00 2001
+From: agent <agent@example.com>
+Date: Sun, 8 Nov 2026 22:37:46 +0800
+Subject: [PATCH] Add V04_E2E_MARKER.txt with v04-e2e-ok
+
+---
+ V04_E2E_MARKER.txt | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 V04_E2E_MARKER.txt
+
+diff --git a/V04_E2E_MARKER.txt b/V04_E2E_MARKER.txt
+new file mode 100644
+index 0000000..d69a7c8
+--- /dev/null
++++ b/V04_E2E_MARKER.txt
+@@ -0,0 +1 @@
++v04-e2e-ok
+\ No newline at end of file
+-- 
+2.43.0
+

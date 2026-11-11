@@ -1,0 +1,19 @@
+# control.toml — 控制 runner 配置
+node_id = "control"
+role = "control"
+capabilities = ["review"]
+capacity = 1
+runtime_url = "http://127.0.0.1:18080"
+runtime_token_env = "RUNTIME_CONTROL_TOKEN"
+opencode_url = "http://127.0.0.1:4096"
+opencode_password_env = "OC_CONTROL_PASSWORD"
+runner_dir = "/root/workspace/runtime-v2-lab/control/runner"
+work_root = "/root/workspace/runtime-v2-lab/control/work"
+poll_seconds = 2
+heartbeat_seconds = 5
+
+# V06: pause before delivering the review result to the planner session
+test_pause_before_result = true
+
+[repositories]
+fixture = "/root/workspace/runtime-v2-lab/fixture.git"

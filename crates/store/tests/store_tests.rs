@@ -237,6 +237,30 @@ fn uncertain_run_blocks_retry_until_resolved() {
 }
 
 #[test]
+fn resolve_close_from_running_reopens_task_for_retry() {
+    // Regression: resolve_run(close) used to leave the task stuck in
+    // `running` (only advance_run's failure path reopened it), making the
+    // operator retry an illegal transition.
+    let s = setup_store();
+    let rid = make_request(&s);
+    submit_plan(&s, &rid, vec![plan_task("t1", &[])]);
+    setup_node(&s, "worker-a", &["fixture-exec"]);
+    let mut node = s.get_node("worker-a", 15).unwrap().unwrap();
+    node.seconds_since_heartbeat = 0;
+    let (task, run) = s.claim_execute(&node, &[], "worker-a").unwrap().unwrap();
+    assert_eq!(s.get_task(&task.task_id).unwrap().state, "running");
+
+    // Operator closes the orphaned run; the task must follow to canceled…
+    s.resolve_run(&run.run_id, true, "sandbox reset orphaned run", "operator").unwrap();
+    let t = s.get_task(&task.task_id).unwrap();
+    assert_eq!(t.state, "canceled");
+    // …and retry must then be a legal transition back to queued.
+    s.retry_task(&task.task_id, "operator").unwrap();
+    let t = s.get_task(&task.task_id).unwrap();
+    assert_eq!(t.state, "queued");
+}
+
+#[test]
 fn review_rejects_mismatched_candidate_sha() {
     let s = setup_store();
     let rid = make_request(&s);
