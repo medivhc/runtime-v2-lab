@@ -1,6 +1,7 @@
 # 任务书：evidence CLI 列表与下载路径修复
 
 - 任务编号：RT-EVIDENCE-1（真实任务试金石 #2，源自 M3/V09-V10 实操缺陷）
+- 前置依赖：RT-PROFILE-1（验收档位参数化，提供 service-v1 档位）先行合入后本任务才可派发
 - 仓库：runtime-v2-lab（evidence 导出 CLI，位于 crates/runtime 或其 bin 目标）
 - 基线：main（派发时 HEAD 为准）
 

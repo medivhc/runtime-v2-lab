@@ -1,8 +1,9 @@
 # 任务书：restore.sh 收尾挂起与探活过早修复
 
 - 任务编号：RT-RESTORE-1（真实任务试金石 #1，源自 M3/V10 实操缺陷）
+- 前置依赖：RT-PROFILE-1（验收档位参数化，提供 service-v1 档位）先行合入后本任务才可派发
 - 仓库：runtime-v2-lab（scripts/restore.sh）
-- 基线：main（85xx 起，以派发时 HEAD 为准）
+- 基线：main（以派发时 HEAD 为准）
 
 ## 背景（实证记录，2026-11-16 V10 检查点恢复实操）
 
