@@ -611,9 +611,32 @@ impl Runner {
             let plan_dir = self.cfg.runner_dir.join("plans");
             std::fs::create_dir_all(&plan_dir)?;
             let plan_file = plan_dir.join(format!("{request_id}.json"));
+            // Fetch request-level requirements so the planner preserves them
+            // in tasks (plan validation rejects silently dropped routes/caps).
+            let req_detail = self.api_get(&format!("/v1/requests/{request_id}")).await.ok().map(|(_, v)| v);
+            let (req_caps, req_routes): (Vec<String>, Vec<String>) = req_detail
+                .as_ref()
+                .map(|v| {
+                    (
+                        v["request"]["required_capabilities"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .unwrap_or_default(),
+                        v["request"]["required_routes"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .unwrap_or_default(),
+                    )
+                })
+                .unwrap_or_default();
+            let caps_json = serde_json::to_string(&req_caps).unwrap_or_else(|_| "[]".into());
+            let routes_json = serde_json::to_string(&req_routes).unwrap_or_else(|_| "[]".into());
             let prompt = format!(
                 "你是规划会话。请针对下面的原始目标，写出一个任务拆解计划。\n\n原始目标：{intent}\n\n\
-                 请把计划写到文件 {}\n格式（严格遵守）：\n{{\n  \"request_id\": \"{request_id}\",\n  \"tasks\": [\n    {{\n      \"key\": \"任务短名\",\n      \"objective\": \"目标\",\n      \"deliverable\": \"交付物\",\n      \"repo_ref\": \"fixture\",\n      \"required_capabilities\": [\"fixture-exec\"],\n      \"acceptance_profile\": \"counter-v1\",\n      \"depends_on\": []\n    }}\n  ]\n}}\n先写临时文件再原子重命名。写完文件后回复 PLAN-WRITTEN。",
+                 请求级约束（每个任务必须原样保留，不得省略）：\n\
+                 - required_capabilities 必须包含：{caps_json}\n\
+                 - required_routes 必须包含：{routes_json}\n\n\
+                 请把计划写到文件 {}\n格式（严格遵守）：\n{{\n  \"request_id\": \"{request_id}\",\n  \"tasks\": [\n    {{\n      \"key\": \"任务短名\",\n      \"objective\": \"目标\",\n      \"deliverable\": \"交付物\",\n      \"repo_ref\": \"fixture\",\n      \"required_capabilities\": {caps_json},\n      \"required_routes\": {routes_json},\n      \"acceptance_profile\": \"counter-v1\",\n      \"depends_on\": []\n    }}\n  ]\n}}\n先写临时文件再原子重命名。写完文件后回复 PLAN-WRITTEN。",
                 plan_file.display()
             );
             let mut plan: Option<Value> = None;

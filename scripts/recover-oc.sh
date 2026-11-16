@@ -9,7 +9,8 @@ mkdir -p $LAB/logs
 GWKEY="$(jq -r .apiKey $LAB/secrets/magpie-provider.json 2>/dev/null)"
 if ! curl -fsS --max-time 3 -H "Authorization: Bearer $GWKEY" http://127.0.0.1:13425/v1/models -o /dev/null 2>/dev/null; then
   pkill -f 'ssh -fN -L 13425' 2>/dev/null
-  setsid nohup ssh -fN -L 13425:10.144.144.3:3425 -p 12224 -i /root/.ssh/id_mesh \
+  setsid nohup ssh -fN -L 13425:10.144.144.3:3425 -p 12224 -i /root/.ssh/mesh_client \
+    -o CertificateFile=/root/.ssh/mesh_client-cert.pub \
     -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
     -o ExitOnForwardFailure=yes root@127.0.0.1 >> $LAB/logs/gw-tunnel.log 2>&1
   sleep 3
