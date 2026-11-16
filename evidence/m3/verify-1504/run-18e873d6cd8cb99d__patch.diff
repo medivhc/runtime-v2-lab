@@ -1,0 +1,20 @@
+From 69b9702d94caaf1dd698e9de4c29c1b3e5265924 Mon Sep 17 00:00:00 2001
+From: Developer <dev@example.com>
+Date: Mon, 16 Nov 2026 14:50:45 +0800
+Subject: [PATCH] Add v09-a marker comment to counter.py
+
+---
+ counter.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/counter.py b/counter.py
+index 9cc9fc9..f9c7eca 100644
+--- a/counter.py
++++ b/counter.py
+@@ -1,2 +1,3 @@
+ def increment(value):
+     return value + 1
++# v09-a marker
+-- 
+2.43.0
+
