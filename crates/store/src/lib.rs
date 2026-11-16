@@ -981,8 +981,12 @@ impl Store {
             };
             if let ClaimDecision::Eligible = evaluate_claim(&node_view, &view, &routes) {
                 // Claim: create run with lease, move task to running.
+                // Lease must outlive the setup phase (checkout + opencode
+                // session creation): 30s stranded every run longer than 30s
+                // because renewals are rejected after expiry. Grant 120s and
+                // let the runner renew every 20s while waiting.
                 let run_id = RunId::generate();
-                let lease_expires = Self::now() + 30;
+                let lease_expires = Self::now() + 120;
                 tx.execute(
                     "INSERT INTO runs (run_id, task_id, run_type, attempt, node_id,
                         lease_generation, lease_expires_at, state)

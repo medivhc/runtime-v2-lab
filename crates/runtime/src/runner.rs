@@ -229,7 +229,7 @@ impl Runner {
                     "model round timeout after {timeout:?}: no assistant text containing {expected_text:?}"
                 );
             }
-            if last_renew.elapsed() >= Duration::from_secs(60) {
+            if last_renew.elapsed() >= Duration::from_secs(20) {
                 if let Err(e) = self.renew(run_id, gen).await {
                     eprintln!("[{}] lease renew while waiting: {e}", self.cfg.node_id);
                 }
