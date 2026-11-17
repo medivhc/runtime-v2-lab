@@ -37,10 +37,19 @@ pub struct ApiError {
 
 impl ApiError {
     fn new(status: StatusCode, code: &str, message: impl Into<String>) -> Self {
-        Self { status, code: code.into(), message: message.into(), request_id: None }
+        Self {
+            status,
+            code: code.into(),
+            message: message.into(),
+            request_id: None,
+        }
     }
     fn unauthorized() -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid token")
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or invalid token",
+        )
     }
     fn forbidden(m: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, "forbidden", m)
@@ -64,7 +73,9 @@ impl From<StoreError> for ApiError {
         match e {
             StoreError::NotFound(m) => Self::not_found(m),
             StoreError::Conflict(m) => Self::conflict(m),
-            StoreError::IdempotencyConflict => Self::conflict("idempotency key reused with different body"),
+            StoreError::IdempotencyConflict => {
+                Self::conflict("idempotency key reused with different body")
+            }
             StoreError::Invalid(m) => Self::invalid(m),
             StoreError::Domain(d) => Self::invalid(d.to_string()),
             StoreError::Db(e) => Self::internal(e.to_string()),
@@ -99,11 +110,11 @@ fn extract_subject(headers: &HeaderMap, state: &AppState) -> Result<Subject, Api
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(ApiError::unauthorized)?;
-    let (id, role) = state
-        .tokens
-        .get(token)
-        .ok_or_else(ApiError::unauthorized)?;
-    Ok(Subject { id: id.clone(), role: *role })
+    let (id, role) = state.tokens.get(token).ok_or_else(ApiError::unauthorized)?;
+    Ok(Subject {
+        id: id.clone(),
+        role: *role,
+    })
 }
 
 fn require(subject: &Subject, action: Action) -> Result<(), ApiError> {
@@ -193,7 +204,9 @@ async fn submit_plan(
     let subject = extract_subject(&headers, &state)?;
     require(&subject, Action::WritePlan)?;
     if subject.id != state.config.planner_node {
-        return Err(ApiError::forbidden("plan submission restricted to planner node"));
+        return Err(ApiError::forbidden(
+            "plan submission restricted to planner node",
+        ));
     }
     let validated = state
         .store
@@ -214,9 +227,18 @@ async fn get_request(
 ) -> ApiResult<Json<Value>> {
     let subject = extract_subject(&headers, &state)?;
     require(&subject, Action::ReadResource).ok(); // read: any authenticated subject
-    let req = state.store.get_request(&request_id).map_err(ApiError::from)?;
-    let tasks = state.store.tasks_for_request(&request_id).map_err(ApiError::from)?;
-    let runs = state.store.runs_for_request(&request_id).map_err(ApiError::from)?;
+    let req = state
+        .store
+        .get_request(&request_id)
+        .map_err(ApiError::from)?;
+    let tasks = state
+        .store
+        .tasks_for_request(&request_id)
+        .map_err(ApiError::from)?;
+    let runs = state
+        .store
+        .runs_for_request(&request_id)
+        .map_err(ApiError::from)?;
     // Return/plan status of the deliver message back to planner.
     Ok(Json(json!({
         "request": req,
@@ -587,7 +609,13 @@ async fn observe_resource(
     require(&subject, Action::UpdateObservation)?;
     state
         .store
-        .observe_route(&resource_id, &subject.id, &body.method, body.valid_seconds, &subject.id)
+        .observe_route(
+            &resource_id,
+            &subject.id,
+            &body.method,
+            body.valid_seconds,
+            &subject.id,
+        )
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -665,7 +693,16 @@ async fn register_evidence(
     }
     state
         .store
-        .add_evidence(&run_id, &body.name, &body.rel_path, &body.sha256, &subject.id, None, None, None)
+        .add_evidence(
+            &run_id,
+            &body.name,
+            &body.rel_path,
+            &body.sha256,
+            &subject.id,
+            None,
+            None,
+            None,
+        )
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -768,7 +805,11 @@ impl AppState {
         }
         for (node_id, node) in &config.nodes {
             if let Ok(t) = std::env::var(&node.token_env) {
-                let role = if node.role == "control" { Role::Control } else { Role::Worker };
+                let role = if node.role == "control" {
+                    Role::Control
+                } else {
+                    Role::Worker
+                };
                 tokens.insert(t, (node_id.clone(), role));
             }
         }

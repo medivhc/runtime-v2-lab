@@ -5,8 +5,8 @@ pub mod error;
 pub mod ids;
 pub mod plan;
 pub mod roles;
-pub mod state;
 pub mod sched;
+pub mod state;
 
 pub use error::DomainError;
 pub use roles::Role;

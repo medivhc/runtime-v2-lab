@@ -130,7 +130,12 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("db open failed: {e}"))?;
             // Register configured repos for plan validation.
             for (name, repo) in &cfg.repositories {
-                store.register_repo(name, &repo.bare_path, &repo.acceptance_profiles)?;
+                store.register_repo(
+                    name,
+                    &repo.bare_path,
+                    &repo.acceptance_profiles,
+                    &repo.acceptance_profile_configs,
+                )?;
             }
             let tokens = service::AppState::token_map(&cfg);
             let state = std::sync::Arc::new(service::AppState {
@@ -185,7 +190,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Evidence { run, out } => {
             // Downloads every registered evidence file for the run.
-            let v = api_get(&format!("/v1/runs/{run}")).await.unwrap_or(json!({}));
+            let v = api_get(&format!("/v1/runs/{run}"))
+                .await
+                .unwrap_or(json!({}));
             let client = reqwest::Client::new();
             std::fs::create_dir_all(&out)?;
             if let Some(files) = v["evidence"].as_array() {
@@ -207,7 +214,11 @@ async fn main() -> anyhow::Result<()> {
             }
             println!("evidence exported to {out}");
         }
-        Cmd::Resolve { run, decision, reason } => {
+        Cmd::Resolve {
+            run,
+            decision,
+            reason,
+        } => {
             let close = matches!(decision.as_str(), "close" | "关闭");
             let body = json!({ "close": close, "reason": reason });
             api_post(&format!("/v1/runs/{run}/resolve"), &body).await?;
