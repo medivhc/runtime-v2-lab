@@ -7,9 +7,26 @@
 
 use anyhow::{anyhow, bail, Context as _};
 use opencode_v2::OcClient;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcceptanceProfileConfig {
+    pub test_cmd: String,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoAcceptanceConfig {
+    #[serde(default)]
+    pub acceptance_profiles: Vec<String>,
+    #[serde(default)]
+    pub acceptance_profile_configs: BTreeMap<String, AcceptanceProfileConfig>,
+}
 
 pub struct RunnerConfig {
     pub node_id: String,
@@ -26,6 +43,10 @@ pub struct RunnerConfig {
     pub repos: Vec<(String, String)>, // (repo_ref, bare_path)
     /// planner_node as configured centrally (control only)
     pub planner_node: String,
+    /// Path to central.toml for acceptance profile configurations
+    pub central_config_path: Option<PathBuf>,
+    /// Parsed acceptance profile configurations per repo
+    pub acceptance_configs: BTreeMap<String, RepoAcceptanceConfig>,
     /// Test-only pause points (spec M2/V05, V06). Disabled unless the
     /// explicit test config flag is present.
     pub test_pause_after_prompt: bool,
@@ -35,8 +56,7 @@ pub struct RunnerConfig {
 impl RunnerConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
-        let v: toml::Value = toml::from_str(&raw)
-            .map_err(|e| anyhow!("config parse: {e}"))?;
+        let v: toml::Value = toml::from_str(&raw).map_err(|e| anyhow!("config parse: {e}"))?;
         let node_id = v
             .get("node_id")
             .and_then(|x| x.as_str())
@@ -49,18 +69,55 @@ impl RunnerConfig {
             .to_string();
         let capabilities = v
             .get("capabilities")
-            .map(|c| c.as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect())
+            .map(|c| {
+                c.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_str().unwrap().to_string())
+                    .collect()
+            })
             .unwrap_or_default();
-        let runtime_url = v.get("runtime_url").and_then(|x| x.as_str()).ok_or_else(|| anyhow!("runtime_url required"))?.to_string();
-        let token_env = v.get("runtime_token_env").and_then(|x| x.as_str()).ok_or_else(|| anyhow!("runtime_token_env required"))?.to_string();
+        let runtime_url = v
+            .get("runtime_url")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("runtime_url required"))?
+            .to_string();
+        let token_env = v
+            .get("runtime_token_env")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("runtime_token_env required"))?
+            .to_string();
         let token = std::env::var(&token_env).map_err(|_| anyhow!("env {token_env} not set"))?;
-        let opencode_url = v.get("opencode_url").and_then(|x| x.as_str()).ok_or_else(|| anyhow!("opencode_url required"))?.to_string();
-        let opencode_password_env = v.get("opencode_password_env").and_then(|x| x.as_str()).ok_or_else(|| anyhow!("opencode_password_env required"))?.to_string();
-        let opencode_password = std::env::var(&opencode_password_env).map_err(|_| anyhow!("env {opencode_password_env} not set"))?;
-        let runner_dir = v.get("runner_dir").and_then(|x| x.as_str()).ok_or_else(|| anyhow!("runner_dir required"))?.to_string();
-        let work_root = v.get("work_root").and_then(|x| x.as_str()).ok_or_else(|| anyhow!("work_root required"))?.to_string();
-        let poll_seconds = v.get("poll_seconds").and_then(|x| x.as_integer()).unwrap_or(2) as u64;
-        let heartbeat_seconds = v.get("heartbeat_seconds").and_then(|x| x.as_integer()).unwrap_or(5) as u64;
+        let opencode_url = v
+            .get("opencode_url")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("opencode_url required"))?
+            .to_string();
+        let opencode_password_env = v
+            .get("opencode_password_env")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("opencode_password_env required"))?
+            .to_string();
+        let opencode_password = std::env::var(&opencode_password_env)
+            .map_err(|_| anyhow!("env {opencode_password_env} not set"))?;
+        let runner_dir = v
+            .get("runner_dir")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("runner_dir required"))?
+            .to_string();
+        let work_root = v
+            .get("work_root")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("work_root required"))?
+            .to_string();
+        let poll_seconds = v
+            .get("poll_seconds")
+            .and_then(|x| x.as_integer())
+            .unwrap_or(2) as u64;
+        let heartbeat_seconds = v
+            .get("heartbeat_seconds")
+            .and_then(|x| x.as_integer())
+            .unwrap_or(5) as u64;
         let mut repos = Vec::new();
         if let Some(r) = v.get("repositories").and_then(|x| x.as_table()) {
             for (k, val) in r {
@@ -68,9 +125,128 @@ impl RunnerConfig {
             }
         }
         let planner_node = "control".to_string();
-        let test_pause_after_prompt = v.get("test_pause_after_prompt").and_then(|x| x.as_bool()).unwrap_or(false);
-        let test_pause_before_result = v.get("test_pause_before_result").and_then(|x| x.as_bool()).unwrap_or(false);
-        Ok(Self { node_id, role, capabilities, runtime_url, token, opencode_url, opencode_password, runner_dir: runner_dir.into(), work_root: work_root.into(), poll_seconds, heartbeat_seconds, repos, planner_node, test_pause_after_prompt, test_pause_before_result })
+        let test_pause_after_prompt = v
+            .get("test_pause_after_prompt")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let test_pause_before_result = v
+            .get("test_pause_before_result")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+
+        // Load central config path if specified
+        let central_config_path = v
+            .get("central_config_path")
+            .and_then(|x| x.as_str())
+            .map(|s| PathBuf::from(s));
+
+        // Load acceptance profile configurations from central.toml
+        let acceptance_configs = if let Some(ref central_path) = central_config_path {
+            Self::load_acceptance_configs(central_path)?
+        } else {
+            BTreeMap::new()
+        };
+
+        Ok(Self {
+            node_id,
+            role,
+            capabilities,
+            runtime_url,
+            token,
+            opencode_url,
+            opencode_password,
+            runner_dir: runner_dir.into(),
+            work_root: work_root.into(),
+            poll_seconds,
+            heartbeat_seconds,
+            repos,
+            planner_node,
+            central_config_path,
+            acceptance_configs,
+            test_pause_after_prompt,
+            test_pause_before_result,
+        })
+    }
+
+    fn load_acceptance_configs(
+        central_path: &Path,
+    ) -> anyhow::Result<BTreeMap<String, RepoAcceptanceConfig>> {
+        let raw = std::fs::read_to_string(central_path)
+            .map_err(|e| anyhow!("central config read failed: {e}"))?;
+        let v: toml::Value =
+            toml::from_str(&raw).map_err(|e| anyhow!("central config parse failed: {e}"))?;
+
+        let mut configs = BTreeMap::new();
+        if let Some(repos) = v.get("repositories").and_then(|x| x.as_table()) {
+            for (repo_name, repo_val) in repos {
+                if let Some(repo_table) = repo_val.as_table() {
+                    let mut repo_config = RepoAcceptanceConfig {
+                        acceptance_profiles: Vec::new(),
+                        acceptance_profile_configs: BTreeMap::new(),
+                    };
+
+                    // Load profile names list (for backward compatibility)
+                    if let Some(profiles) = repo_table
+                        .get("acceptance_profiles")
+                        .and_then(|x| x.as_array())
+                    {
+                        for p in profiles {
+                            if let Some(name) = p.as_str() {
+                                repo_config.acceptance_profiles.push(name.to_string());
+                            }
+                        }
+                    }
+
+                    // Load detailed profile configs
+                    if let Some(profile_configs) = repo_table
+                        .get("acceptance_profiles")
+                        .and_then(|x| x.as_table())
+                    {
+                        // Check if it's the new format (table of profile configs) vs old format (array of names)
+                        // The new format has tables with test_cmd and allowed_paths
+                        let is_new_format = profile_configs.values().any(|v| v.is_table());
+                        if is_new_format {
+                            for (profile_name, profile_val) in profile_configs {
+                                if let Some(profile_table) = profile_val.as_table() {
+                                    if let Some(test_cmd) =
+                                        profile_table.get("test_cmd").and_then(|x| x.as_str())
+                                    {
+                                        let allowed_paths = profile_table
+                                            .get("allowed_paths")
+                                            .and_then(|x| x.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(|v| {
+                                                        v.as_str().map(|s| s.to_string())
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        repo_config.acceptance_profile_configs.insert(
+                                            profile_name.clone(),
+                                            AcceptanceProfileConfig {
+                                                test_cmd: test_cmd.to_string(),
+                                                allowed_paths,
+                                            },
+                                        );
+                                        // Also add to profiles list if not already there
+                                        if !repo_config.acceptance_profiles.contains(&profile_name)
+                                        {
+                                            repo_config
+                                                .acceptance_profiles
+                                                .push(profile_name.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    configs.insert(repo_name.clone(), repo_config);
+                }
+            }
+        }
+        Ok(configs)
     }
 }
 
@@ -101,7 +277,12 @@ impl Runner {
         let oc = OcClient::new(&cfg.opencode_url, &cfg.opencode_password);
         std::fs::create_dir_all(&cfg.runner_dir).ok();
         let state_path = cfg.runner_dir.join("runner-state.json");
-        Self { cfg, http, oc, state_path }
+        Self {
+            cfg,
+            http,
+            oc,
+            state_path,
+        }
     }
 
     fn token(&self) -> String {
@@ -167,7 +348,10 @@ impl Runner {
     pub async fn heartbeat(&self) -> anyhow::Result<()> {
         let repos: Vec<String> = self.cfg.repos.iter().map(|(r, _)| r.clone()).collect();
         let (status, v) = self
-            .api_post("/v1/nodes/heartbeat", &json!({"capacity": 1, "repo_refs": repos}))
+            .api_post(
+                "/v1/nodes/heartbeat",
+                &json!({"capacity": 1, "repo_refs": repos}),
+            )
             .await?;
         if status != 200 {
             bail!("heartbeat failed: {status} {v}");
@@ -177,7 +361,14 @@ impl Runner {
 
     // ---------- shared run helpers ----------
 
-    async fn advance(&self, run_id: &str, gen: i64, to: &str, session_id: Option<&str>, candidate_sha: Option<&str>) -> anyhow::Result<()> {
+    async fn advance(
+        &self,
+        run_id: &str,
+        gen: i64,
+        to: &str,
+        session_id: Option<&str>,
+        candidate_sha: Option<&str>,
+    ) -> anyhow::Result<()> {
         let (status, v) = self
             .api_post(
                 &format!("/v1/runs/{run_id}/events"),
@@ -192,7 +383,10 @@ impl Runner {
 
     async fn renew(&self, run_id: &str, gen: i64) -> anyhow::Result<()> {
         let (status, v) = self
-            .api_post(&format!("/v1/runs/{run_id}/renew"), &json!({"lease_generation": gen}))
+            .api_post(
+                &format!("/v1/runs/{run_id}/renew"),
+                &json!({"lease_generation": gen}),
+            )
             .await?;
         if status != 200 {
             bail!("renew {run_id}: {status} {v}");
@@ -220,7 +414,9 @@ impl Runner {
         // working, so the wait must not return before the idle marker.
         loop {
             let history = self.oc.history(session_id, 100).await?;
-            let matched = history.iter().any(|m| m.kind == "assistant" && m.contains_text(expected_text));
+            let matched = history
+                .iter()
+                .any(|m| m.kind == "assistant" && m.contains_text(expected_text));
             if matched && history.iter().any(|m| m.kind == "idle") {
                 return Ok(history);
             }
@@ -249,7 +445,13 @@ impl Runner {
     }
 
     /// Register a directory as evidence (sha256 computed by center).
-    async fn register_evidence(&self, run_id: &str, evidence_root: &Path, rel_path: &str, name: &str) -> anyhow::Result<()> {
+    async fn register_evidence(
+        &self,
+        run_id: &str,
+        evidence_root: &Path,
+        rel_path: &str,
+        name: &str,
+    ) -> anyhow::Result<()> {
         let full = evidence_root.join(rel_path);
         let bytes = std::fs::read(&full).with_context(|| format!("read evidence {full:?}"))?;
         use sha2::{Digest, Sha256};
@@ -330,11 +532,19 @@ impl Runner {
         }
     }
 
-    async fn worker_execute(&self, task_id: &str, run_id: &str, objective: &str) -> anyhow::Result<()> {
+    async fn worker_execute(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        objective: &str,
+    ) -> anyhow::Result<()> {
         // Fetch task + run info from center.
         let (status, v) = self.api_get(&format!("/v1/tasks/{task_id}")).await?;
         anyhow::ensure!(status == 200, "task fetch {task_id}: {status} {v}");
-        let repo_ref = v["task"]["repo_ref"].as_str().unwrap_or("fixture").to_string();
+        let repo_ref = v["task"]["repo_ref"]
+            .as_str()
+            .unwrap_or("fixture")
+            .to_string();
         let baseline = self.baseline_sha(&repo_ref)?;
         let bare = self.bare_path(&repo_ref)?;
         let gen = self.run_generation(run_id).await;
@@ -365,10 +575,16 @@ impl Runner {
         } else {
             self.create_session_for_run(&checkout, run_id).await?
         };
-        if let Err(e) = self.advance(run_id, gen, "session_bound", Some(&session_id), None).await {
+        if let Err(e) = self
+            .advance(run_id, gen, "session_bound", Some(&session_id), None)
+            .await
+        {
             // Resumed runs are already session_bound; tolerate that and let
             // the next advance catch any real lease problem.
-            eprintln!("[worker-{}] session_bound advance tolerated: {e}", self.cfg.node_id);
+            eprintln!(
+                "[worker-{}] session_bound advance tolerated: {e}",
+                self.cfg.node_id
+            );
         }
 
         // Persist before prompt (durability). A prior attempt's message ID is
@@ -427,10 +643,14 @@ impl Runner {
                 request_text: Some(request_text.clone()),
                 phase: "prompt".into(),
             });
-            eprintln!("[worker-{}] TEST-PAUSE after prompt delivery (run {run_id}); exiting", self.cfg.node_id);
+            eprintln!(
+                "[worker-{}] TEST-PAUSE after prompt delivery (run {run_id}); exiting",
+                self.cfg.node_id
+            );
             std::process::exit(0);
         }
-        self.advance(run_id, gen, "prompt_admitted", Some(&session_id), None).await?;
+        self.advance(run_id, gen, "prompt_admitted", Some(&session_id), None)
+            .await?;
 
         // Wait for the model round; the assistant reply marks activity.
         // Long model rounds outlive the original lease, so renew it
@@ -440,7 +660,8 @@ impl Runner {
             .await
             .context("model round")?;
         let _ = hist;
-        self.advance(run_id, gen, "running", Some(&session_id), None).await?;
+        self.advance(run_id, gen, "running", Some(&session_id), None)
+            .await?;
 
         // Commit any changes.
         let candidate = commit_all(&checkout)?;
@@ -450,7 +671,10 @@ impl Runner {
         push_run_ref(&bare, &checkout, &run_ref, &candidate)?;
 
         // Evidence: patch + log.
-        let evidence_root = PathBuf::from(std::env::var("RUNTIME_EVIDENCE_ROOT").unwrap_or_else(|_| "/root/workspace/runtime-v2-lab/central/evidence".into()));
+        let evidence_root = PathBuf::from(
+            std::env::var("RUNTIME_EVIDENCE_ROOT")
+                .unwrap_or_else(|_| "/root/workspace/runtime-v2-lab/central/evidence".into()),
+        );
         let rel_patch = format!("{run_id}/patch.diff");
         let rel_log = format!("{run_id}/git.log");
         std::fs::create_dir_all(evidence_root.join(run_id))?;
@@ -464,8 +688,10 @@ impl Runner {
             .current_dir(&checkout)
             .output()?;
         std::fs::write(evidence_root.join(&rel_log), &log.stdout)?;
-        self.register_evidence(run_id, &evidence_root, &rel_patch, "patch").await?;
-        self.register_evidence(run_id, &evidence_root, &rel_log, "git-log").await?;
+        self.register_evidence(run_id, &evidence_root, &rel_patch, "patch")
+            .await?;
+        self.register_evidence(run_id, &evidence_root, &rel_log, "git-log")
+            .await?;
 
         // Finish: task → awaiting_review, review run queued.
         let (_status, v) = self
@@ -474,7 +700,10 @@ impl Runner {
                 &json!({"session_id": session_id, "candidate_sha": candidate}),
             )
             .await?;
-        anyhow::ensure!(v["review_run_id"].is_string(), "finish {run_id}: {_status} {v}");
+        anyhow::ensure!(
+            v["review_run_id"].is_string(),
+            "finish {run_id}: {_status} {v}"
+        );
         self.save_state(&RunState {
             run_id: run_id.to_string(),
             task_id: task_id.to_string(),
@@ -484,14 +713,24 @@ impl Runner {
             phase: "finished".into(),
         });
         self.clear_state();
-        eprintln!("[worker-{}] run {run_id} finished, candidate {candidate}", self.cfg.node_id);
+        eprintln!(
+            "[worker-{}] run {run_id} finished, candidate {candidate}",
+            self.cfg.node_id
+        );
         Ok(())
     }
 
-    async fn create_session_for_run(&self, checkout: &Path, run_id: &str) -> anyhow::Result<String> {
+    async fn create_session_for_run(
+        &self,
+        checkout: &Path,
+        run_id: &str,
+    ) -> anyhow::Result<String> {
         let s = self
             .oc
-            .create_session(&format!("runtime run {run_id}"), &checkout.display().to_string())
+            .create_session(
+                &format!("runtime run {run_id}"),
+                &checkout.display().to_string(),
+            )
             .await?;
         Ok(s.id)
     }
@@ -522,26 +761,50 @@ impl Runner {
         let mut hb = tokio::time::interval(Duration::from_secs(self.cfg.heartbeat_seconds));
         // Fixed planner session (create or reuse).
         let state_file = self.cfg.runner_dir.join("planner-session.json");
-        let planner_session = match std::fs::read(&state_file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+        let planner_session = match std::fs::read(&state_file)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        {
             Some(v) => {
                 let sid = v["session_id"].as_str().unwrap_or_default().to_string();
                 if self.oc.get_session(&sid).await?.is_some() {
                     sid
                 } else {
                     // Session lost: center marks binding blocked via report.
-                    let s = self.oc.create_session("runtime planner", &self.cfg.runner_dir.display().to_string()).await?;
-                    std::fs::write(&state_file, serde_json::to_vec(&json!({"session_id": s.id}))?)?;
+                    let s = self
+                        .oc
+                        .create_session(
+                            "runtime planner",
+                            &self.cfg.runner_dir.display().to_string(),
+                        )
+                        .await?;
+                    std::fs::write(
+                        &state_file,
+                        serde_json::to_vec(&json!({"session_id": s.id}))?,
+                    )?;
                     s.id
                 }
             }
             None => {
-                let s = self.oc.create_session("runtime planner", &self.cfg.runner_dir.display().to_string()).await?;
-                std::fs::write(&state_file, serde_json::to_vec(&json!({"session_id": s.id}))?)?;
+                let s = self
+                    .oc
+                    .create_session(
+                        "runtime planner",
+                        &self.cfg.runner_dir.display().to_string(),
+                    )
+                    .await?;
+                std::fs::write(
+                    &state_file,
+                    serde_json::to_vec(&json!({"session_id": s.id}))?,
+                )?;
                 s.id
             }
         };
         let (status, v) = self
-            .api_put("/v1/planner/binding", &json!({"session_id": planner_session}))
+            .api_put(
+                "/v1/planner/binding",
+                &json!({"session_id": planner_session}),
+            )
             .await?;
         anyhow::ensure!(status == 200, "planner binding: {status} {v}");
         eprintln!("[control] planner session bound: {planner_session}");
@@ -553,7 +816,10 @@ impl Runner {
         if let Ok(raw) = std::fs::read(&pending_path) {
             if let Ok(p) = serde_json::from_slice::<Value>(&raw) {
                 let (sid, mid, text) = (
-                    p["planner_session"].as_str().unwrap_or_default().to_string(),
+                    p["planner_session"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
                     p["result_mid"].as_str().unwrap_or_default().to_string(),
                     p["result_text"].as_str().unwrap_or_default().to_string(),
                 );
@@ -589,7 +855,11 @@ impl Runner {
         }
     }
 
-    async fn process_planning(&self, planner_session: &str, after_cursor: &mut String) -> anyhow::Result<()> {
+    async fn process_planning(
+        &self,
+        planner_session: &str,
+        after_cursor: &mut String,
+    ) -> anyhow::Result<()> {
         let (status, v) = self
             .api_get(&format!("/v1/inbox?after={after_cursor}&limit=50"))
             .await?;
@@ -600,31 +870,48 @@ impl Runner {
             let request_id = msg["request_id"].as_str().unwrap_or_default().to_string();
             if kind != "plan_request" || request_id.is_empty() {
                 // Unknown kinds: ack to avoid redelivery loops.
-                let _ = self.api_post(&format!("/v1/messages/{mid}/ack"), &json!({})).await;
+                let _ = self
+                    .api_post(&format!("/v1/messages/{mid}/ack"), &json!({}))
+                    .await;
                 continue;
             }
             let intent = msg["body"].as_str().unwrap_or_default().to_string();
             // Deliver to planner session with stable message ID derived from the message.
             // A failed model round (e.g. gateway outage) leaves the queued prompt
             // un-rerunnable under the same ID, so retries use a fresh suffixed ID.
-            let stable_mid = format!("msg_plan_{}", mid.replace(|c: char| !c.is_ascii_alphanumeric(), ""));
+            let stable_mid = format!(
+                "msg_plan_{}",
+                mid.replace(|c: char| !c.is_ascii_alphanumeric(), "")
+            );
             let plan_dir = self.cfg.runner_dir.join("plans");
             std::fs::create_dir_all(&plan_dir)?;
             let plan_file = plan_dir.join(format!("{request_id}.json"));
             // Fetch request-level requirements so the planner preserves them
             // in tasks (plan validation rejects silently dropped routes/caps).
-            let req_detail = self.api_get(&format!("/v1/requests/{request_id}")).await.ok().map(|(_, v)| v);
+            let req_detail = self
+                .api_get(&format!("/v1/requests/{request_id}"))
+                .await
+                .ok()
+                .map(|(_, v)| v);
             let (req_caps, req_routes): (Vec<String>, Vec<String>) = req_detail
                 .as_ref()
                 .map(|v| {
                     (
                         v["request"]["required_capabilities"]
                             .as_array()
-                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default(),
                         v["request"]["required_routes"]
                             .as_array()
-                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default(),
                     )
                 })
@@ -641,12 +928,19 @@ impl Runner {
             );
             let mut plan: Option<Value> = None;
             for attempt in 1..=3u32 {
-                let mid_attempt =
-                    if attempt == 1 { stable_mid.clone() } else { format!("{stable_mid}_r{attempt}") };
+                let mid_attempt = if attempt == 1 {
+                    stable_mid.clone()
+                } else {
+                    format!("{stable_mid}_r{attempt}")
+                };
                 if attempt > 1 {
-                    eprintln!("[control] retrying planner prompt for {request_id} (attempt {attempt})");
+                    eprintln!(
+                        "[control] retrying planner prompt for {request_id} (attempt {attempt})"
+                    );
                 }
-                self.oc.prompt(planner_session, &mid_attempt, &prompt).await?;
+                self.oc
+                    .prompt(planner_session, &mid_attempt, &prompt)
+                    .await?;
                 // Wait for the plan file (up to 300 s), then validate and submit.
                 for _ in 0..300 {
                     if let Ok(text) = std::fs::read_to_string(&plan_file) {
@@ -661,20 +955,32 @@ impl Runner {
                     break;
                 }
             }
-            let plan = plan.ok_or_else(|| anyhow!("planner did not write {plan_file:?} in time"))?;
+            let plan =
+                plan.ok_or_else(|| anyhow!("planner did not write {plan_file:?} in time"))?;
             let (status, v) = self
                 .api_put(&format!("/v1/requests/{request_id}/plan"), &plan)
                 .await?;
-            if status != 200 && v["message"].as_str().map(|m| m.contains("not in planning state")).unwrap_or(false) {
+            if status != 200
+                && v["message"]
+                    .as_str()
+                    .map(|m| m.contains("not in planning state"))
+                    .unwrap_or(false)
+            {
                 // Already planned (duplicate redelivery): ack and move on
                 // instead of stalling the inbox behind a doomed submit.
-                eprintln!("[control] plan for {request_id} already submitted; acking stale message");
-                let _ = self.api_post(&format!("/v1/messages/{mid}/ack"), &json!({})).await;
+                eprintln!(
+                    "[control] plan for {request_id} already submitted; acking stale message"
+                );
+                let _ = self
+                    .api_post(&format!("/v1/messages/{mid}/ack"), &json!({}))
+                    .await;
                 *after_cursor = mid;
                 continue;
             }
             anyhow::ensure!(status == 200, "plan submit {request_id}: {status} {v}");
-            let _ = self.api_post(&format!("/v1/messages/{mid}/ack"), &json!({})).await;
+            let _ = self
+                .api_post(&format!("/v1/messages/{mid}/ack"), &json!({}))
+                .await;
             eprintln!("[control] plan submitted for {request_id}");
             // Advance cursor past this message.
             *after_cursor = mid;
@@ -690,18 +996,56 @@ impl Runner {
             return Ok(());
         }
         anyhow::ensure!(status == 200, "review claim: {status} {v}");
-        let review_run = v["review"]["run_id"].as_str().unwrap_or_default().to_string();
-        let executed_run = v["executed"]["run_id"].as_str().unwrap_or_default().to_string();
-        let candidate_sha = v["executed"]["candidate_sha"].as_str().unwrap_or_default().to_string();
-        let task_id = v["review"]["task_id"].as_str().unwrap_or_default().to_string();
+        let review_run = v["review"]["run_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let executed_run = v["executed"]["run_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let candidate_sha = v["executed"]["candidate_sha"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let task_id = v["review"]["task_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let gen = v["lease_generation"].as_i64().unwrap_or(1);
         eprintln!("[control] review {review_run} of {executed_run} candidate {candidate_sha}");
 
         // Task context.
         let (_s, tv) = self.api_get(&format!("/v1/tasks/{task_id}")).await?;
-        let repo_ref = tv["task"]["repo_ref"].as_str().unwrap_or("fixture").to_string();
+        let repo_ref = tv["task"]["repo_ref"]
+            .as_str()
+            .unwrap_or("fixture")
+            .to_string();
+        let acceptance_profile = tv["task"]["acceptance_profile"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let baseline = self.baseline_sha(&repo_ref)?;
         let bare = self.bare_path(&repo_ref)?;
+
+        // Look up acceptance profile configuration.
+        let repo_config = self
+            .cfg
+            .acceptance_configs
+            .get(&repo_ref)
+            .ok_or_else(|| anyhow!("no acceptance config for repo {repo_ref}"))?;
+        let profile_config = repo_config
+            .acceptance_profile_configs
+            .get(&acceptance_profile)
+            .ok_or_else(|| {
+                anyhow!(
+                    "acceptance profile {acceptance_profile} not configured for repo {repo_ref}"
+                )
+            })?;
+
+        if profile_config.test_cmd.trim().is_empty() {
+            bail!("acceptance profile {acceptance_profile} for repo {repo_ref} has empty test_cmd");
+        }
 
         // Fixed acceptance: extract baseline test + candidate source in isolation.
         let review_dir = self.cfg.work_root.join(&review_run);
@@ -714,6 +1058,7 @@ impl Runner {
 
         let mut fixed_exit = 1i32;
         let mut fixed_note = String::new();
+
         // 1) merge-base ancestry
         let ancestor = std::process::Command::new("git")
             .args(["merge-base", "--is-ancestor", &baseline, &candidate_sha])
@@ -725,47 +1070,111 @@ impl Runner {
                 fixed_note.push_str("candidate is not a descendant of baseline; ");
             }
         }
-        // 2) diff scope: only counter.py
+
+        // 2) diff scope: validate against allowed_paths
         let diff = std::process::Command::new("git")
             .args(["diff", "--name-only", &baseline, &candidate_sha])
             .env("GIT_DIR", &bare)
             .output()?;
         let diff_text = String::from_utf8_lossy(&diff.stdout).to_string();
-        let changed: Vec<&str> = diff_text
+        let changed: Vec<String> = diff_text
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
+            .map(|s| s.to_string())
             .collect();
-        if changed != ["counter.py"] {
-            fixed_note.push_str(&format!("changed files {changed:?} != [counter.py]; "));
+
+        if !profile_config.allowed_paths.is_empty() {
+            let mut all_allowed = true;
+            for file in &changed {
+                let mut file_allowed = false;
+                for pattern in &profile_config.allowed_paths {
+                    if Self::glob_match(pattern, file) {
+                        file_allowed = true;
+                        break;
+                    }
+                }
+                if !file_allowed {
+                    fixed_note.push_str(&format!(
+                        "changed file {file} not allowed by profile {acceptance_profile}; "
+                    ));
+                    all_allowed = false;
+                }
+            }
+            if all_allowed && !changed.is_empty() {
+                fixed_note.push_str("all changed files allowed by profile; ");
+            } else if changed.is_empty() {
+                fixed_note.push_str("no changed files; ");
+            }
+        } else {
+            fixed_note.push_str("allowed_paths empty (no restriction); ");
         }
-        // 3) fixed test: baseline test_counter.py against candidate counter.py
-        std::fs::copy(base_dir.join("test_counter.py"), review_dir.join("test_counter.py"))?;
-        std::fs::copy(cand_dir.join("counter.py"), review_dir.join("counter.py"))?;
-        let test = std::process::Command::new("python3")
-            .args(["-m", "unittest", "-v", "test_counter"])
-            .env("PYTHONDONTWRITEBYTECODE", "1")
+
+        // 3) fixed test: execute test_cmd in review_dir
+        let test_cmd = &profile_config.test_cmd;
+        eprintln!(
+            "[control] executing test_cmd: {test_cmd} in {}",
+            review_dir.display()
+        );
+        let test = std::process::Command::new("sh")
+            .args(["-c", test_cmd])
             .current_dir(&review_dir)
             .status();
         match test {
             Ok(s) => fixed_exit = s.code().unwrap_or(1),
-            Err(e) => fixed_note.push_str(&format!("test spawn error {e}")),
+            Err(e) => fixed_note.push_str(&format!("test spawn error {e}; ")),
         }
 
+        // Capture test output tail for evidence (last 50 lines)
+        let test_output_tail = std::process::Command::new("sh")
+            .args(["-c", test_cmd])
+            .current_dir(&review_dir)
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|out| {
+                out.lines()
+                    .rev()
+                    .take(50)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| "no output captured".to_string());
+
         // Agent verdict (review session, per-review fresh session).
-        let review_session = self.oc.create_session(&format!("runtime review {review_run}"), &review_dir.display().to_string()).await?;
+        let review_session = self
+            .oc
+            .create_session(
+                &format!("runtime review {review_run}"),
+                &review_dir.display().to_string(),
+            )
+            .await?;
         let verdict_prompt = format!(
             "你是独立验收会话。请检查以下验收材料并给出结论。\n\n\
-             候选 SHA：{candidate_sha}\n基线 SHA：{baseline}\n固定测试退出码：{fixed_exit}\n差异检查备注：{fixed_note}\n\n\
-             请在仓库目录 {} 里查看实际文件内容（counter.py、test_counter.py）。\n\
+             候选 SHA：{candidate_sha}\n基线 SHA：{baseline}\n验收档位：{acceptance_profile}\n固定测试退出码：{fixed_exit}\n差异检查备注：{fixed_note}\n测试输出尾部：\n{test_output_tail}\n\n\
+             请在仓库目录 {} 里查看实际文件内容。\n\
              只回复 JSON：{{\"verdict\":\"pass\"}} 或 {{\"verdict\":\"fail\",\"reason\":\"...\"}}。\n\
-             注意：只有固定测试退出码为 0、差异只涉及 counter.py、且代码确实实现了任务目标时才能给 pass。",
+             注意：只有固定测试退出码为 0、差异符合 allowed_paths、且代码确实实现了任务目标时才能给 pass。",
             review_dir.display()
         );
-        let stable_mid = format!("msg_rev_{}", review_run.replace(|c: char| !c.is_ascii_alphanumeric(), ""));
-        self.oc.prompt(&review_session.id, &stable_mid, &verdict_prompt).await?;
+        let stable_mid = format!(
+            "msg_rev_{}",
+            review_run.replace(|c: char| !c.is_ascii_alphanumeric(), "")
+        );
+        self.oc
+            .prompt(&review_session.id, &stable_mid, &verdict_prompt)
+            .await?;
         let hist = self
-            .wait_with_renew(&review_session.id, "verdict", Duration::from_secs(900), &review_run, gen)
+            .wait_with_renew(
+                &review_session.id,
+                "verdict",
+                Duration::from_secs(900),
+                &review_run,
+                gen,
+            )
             .await
             .context("review agent round")?;
         let reply = hist
@@ -790,7 +1199,11 @@ impl Runner {
             })
             .and_then(|v| v["verdict"].as_str().map(str::to_string))
             .unwrap_or_else(|| {
-                if reply.contains("\"pass\"") { "pass".into() } else { "fail".into() }
+                if reply.contains("\"pass\"") {
+                    "pass".into()
+                } else {
+                    "fail".into()
+                }
             });
         eprintln!("[control] agent verdict: {agent_verdict} (fixed_exit={fixed_exit})");
 
@@ -814,32 +1227,204 @@ impl Runner {
         // reaches the planner session, persisting it for restart recovery.
         let result_id = format!("result_{review_run}");
         let result_text = format!(
-            "任务 {task_id} 验收完成：{final_verdict}。候选 {candidate_sha}，固定测试退出码 {fixed_exit}，结果 ID {result_id}。请只回复该结果 ID 以确认收到。"
+            "任务 {task_id} 验收完成：{final_verdict}。候选 {candidate_sha}，验收档位 {acceptance_profile}，固定测试退出码 {fixed_exit}，结果 ID {result_id}。请只回复该结果 ID 以确认收到。"
         );
-        let result_mid = format!("msg_result_{}", review_run.replace(|c: char| !c.is_ascii_alphanumeric(), ""));
+        let result_mid = format!(
+            "msg_result_{}",
+            review_run.replace(|c: char| !c.is_ascii_alphanumeric(), "")
+        );
         if self.cfg.test_pause_before_result {
             let pending = self.cfg.runner_dir.join("pending_result.json");
             std::fs::create_dir_all(&self.cfg.runner_dir)?;
-            std::fs::write(&pending, json!({
-                "planner_session": planner_session,
-                "result_mid": result_mid,
-                "result_id": result_id,
-                "result_text": result_text,
-            }).to_string())?;
+            std::fs::write(
+                &pending,
+                json!({
+                    "planner_session": planner_session,
+                    "result_mid": result_mid,
+                    "result_id": result_id,
+                    "result_text": result_text,
+                })
+                .to_string(),
+            )?;
             eprintln!("[control] TEST-PAUSE before result delivery (run {review_run}); exiting");
             std::process::exit(0);
         }
-        self.oc.prompt(planner_session, &result_mid, &result_text).await?;
-        let _ = self.oc.wait_for_reply(planner_session, &result_id, Duration::from_secs(600)).await;
+        self.oc
+            .prompt(planner_session, &result_mid, &result_text)
+            .await?;
+        let _ = self
+            .oc
+            .wait_for_reply(planner_session, &result_id, Duration::from_secs(600))
+            .await;
 
         // Review run → finished. A silent failure here strands the review run
         // in an active state and later blocks retry review inserts (unique
         // active-review constraint), so surface it.
-        if let Err(e) = self.advance(&review_run, gen, "finished", Some(&review_session.id), Some(&candidate_sha)).await {
+        if let Err(e) = self
+            .advance(
+                &review_run,
+                gen,
+                "finished",
+                Some(&review_session.id),
+                Some(&candidate_sha),
+            )
+            .await
+        {
             eprintln!("[control] review run finish failed: {e}");
         }
         eprintln!("[control] review {review_run} submitted: {final_verdict}");
         Ok(())
+    }
+
+    /// Simple glob pattern matching for allowed_paths.
+    /// Supports * (any chars except /), ** (any chars including /), and exact match.
+    fn glob_match(pattern: &str, path: &str) -> bool {
+        // Convert glob to regex-like matching
+        // Handle ** first (must be before *)
+        let pattern = pattern.replace('.', "\\.");
+        let pattern = pattern.replace("**", "__DOUBLE_STAR__");
+        let pattern = pattern.replace('*', "[^/]*");
+        let pattern = pattern.replace("__DOUBLE_STAR__", ".*");
+        let regex_pattern = format!("^{}$", pattern);
+        regex::Regex::new(&regex_pattern)
+            .map(|re| re.is_match(path))
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn make_central_toml(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("central.toml");
+        fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn load_acceptance_configs_new_format() {
+        // TOML separate table header format - profiles array is inferred from profile configs
+        let toml_content = r#"
+[repositories.fixture]
+bare_path = "/tmp/fixture.git"
+
+[repositories.fixture.acceptance_profiles.counter-v1]
+test_cmd = "python3 -m unittest -v test_counter"
+allowed_paths = ["counter.py", "test_counter.py"]
+
+[repositories.fixture.acceptance_profiles.service-v1]
+test_cmd = "cargo fmt --check && cargo clippy -- -D warnings && cargo test"
+allowed_paths = ["scripts/**", "crates/service/**"]
+"#;
+        let (_dir, path) = make_central_toml(toml_content);
+        let configs = RunnerConfig::load_acceptance_configs(&path).unwrap();
+
+        let repo_config = configs.get("fixture").expect("fixture repo config");
+        assert_eq!(repo_config.acceptance_profiles.len(), 2);
+        assert!(repo_config
+            .acceptance_profiles
+            .contains(&"counter-v1".to_string()));
+        assert!(repo_config
+            .acceptance_profiles
+            .contains(&"service-v1".to_string()));
+
+        let counter_cfg = repo_config
+            .acceptance_profile_configs
+            .get("counter-v1")
+            .expect("counter-v1 profile");
+        assert_eq!(counter_cfg.test_cmd, "python3 -m unittest -v test_counter");
+        assert_eq!(
+            counter_cfg.allowed_paths,
+            vec!["counter.py", "test_counter.py"]
+        );
+
+        let service_cfg = repo_config
+            .acceptance_profile_configs
+            .get("service-v1")
+            .expect("service-v1 profile");
+        assert_eq!(
+            service_cfg.test_cmd,
+            "cargo fmt --check && cargo clippy -- -D warnings && cargo test"
+        );
+        assert_eq!(
+            service_cfg.allowed_paths,
+            vec!["scripts/**", "crates/service/**"]
+        );
+    }
+
+    #[test]
+    fn load_acceptance_configs_old_format_array_only() {
+        let toml_content = r#"
+[repositories.fixture]
+bare_path = "/tmp/fixture.git"
+acceptance_profiles = ["counter-v1"]
+"#;
+        let (_dir, path) = make_central_toml(toml_content);
+        let configs = RunnerConfig::load_acceptance_configs(&path).unwrap();
+
+        let repo_config = configs.get("fixture").expect("fixture repo config");
+        assert_eq!(repo_config.acceptance_profiles, vec!["counter-v1"]);
+        assert!(repo_config.acceptance_profile_configs.is_empty());
+    }
+
+    #[test]
+    fn load_acceptance_configs_missing_config_is_empty() {
+        let toml_content = r#"
+[repositories.other]
+bare_path = "/tmp/other.git"
+acceptance_profiles = ["some-profile"]
+"#;
+        let (_dir, path) = make_central_toml(toml_content);
+        let configs = RunnerConfig::load_acceptance_configs(&path).unwrap();
+        // fixture not in config -> empty
+        assert!(configs.get("fixture").is_none());
+    }
+
+    #[test]
+    fn glob_match_exact() {
+        assert!(Runner::glob_match("counter.py", "counter.py"));
+        assert!(!Runner::glob_match("counter.py", "other.py"));
+    }
+
+    #[test]
+    fn glob_match_star() {
+        assert!(Runner::glob_match("*.py", "counter.py"));
+        assert!(Runner::glob_match("*.py", "test_counter.py"));
+        assert!(!Runner::glob_match("*.py", "counter.rs"));
+        assert!(!Runner::glob_match("*.py", "dir/counter.py")); // * doesn't match /
+    }
+
+    #[test]
+    fn glob_match_double_star() {
+        assert!(Runner::glob_match("scripts/**", "scripts/restore.sh"));
+        assert!(Runner::glob_match("scripts/**", "scripts/subdir/file.sh"));
+        assert!(Runner::glob_match("crates/**", "crates/service/src/lib.rs"));
+        assert!(Runner::glob_match("**", "any/path/file.txt"));
+        assert!(!Runner::glob_match("scripts/**", "other/file.sh"));
+    }
+
+    #[test]
+    fn glob_match_mixed() {
+        assert!(Runner::glob_match("scripts/*.sh", "scripts/restore.sh"));
+        assert!(!Runner::glob_match(
+            "scripts/*.sh",
+            "scripts/sub/restore.sh"
+        ));
+        assert!(Runner::glob_match(
+            "scripts/**/*.sh",
+            "scripts/sub/restore.sh"
+        ));
+    }
+
+    #[test]
+    fn glob_match_special_chars() {
+        assert!(Runner::glob_match("test.counter", "test.counter"));
+        assert!(!Runner::glob_match("test.counter", "testXcounter"));
     }
 }
 
@@ -865,10 +1450,13 @@ fn checkout_root(dir: &Path, bare: &str, sha: &str) -> anyhow::Result<()> {
         // Reuse the existing checkout: the NFS-backed workspace keeps .nfs
         // silly-renames for recently closed pack files, so remove_dir_all can
         // fail with EBUSY. Re-sync in place instead of re-cloning.
-        git_in(&["fetch", bare,
-                 "+refs/heads/*:refs/remotes/origin/*",
-                 "+refs/runs/*:refs/remotes/origin/runs/*",
-                 "--prune"])?;
+        git_in(&[
+            "fetch",
+            bare,
+            "+refs/heads/*:refs/remotes/origin/*",
+            "+refs/runs/*:refs/remotes/origin/runs/*",
+            "--prune",
+        ])?;
         git_in(&["checkout", "--detach", "--force", sha])?;
         git_in(&["reset", "--hard", sha])?;
         git_in(&["clean", "-fdx"])?;
@@ -913,7 +1501,10 @@ fn checkout_root(dir: &Path, bare: &str, sha: &str) -> anyhow::Result<()> {
         .output()
         .context("checkout sha")?;
     if !st.status.success() {
-        bail!("checkout {sha} failed: {}", String::from_utf8_lossy(&st.stderr));
+        bail!(
+            "checkout {sha} failed: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
     }
     let _ = run;
     Ok(())

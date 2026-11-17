@@ -91,10 +91,19 @@ pub struct NodeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcceptanceProfileConfig {
+    pub test_cmd: String,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
     pub bare_path: String,
     #[serde(default)]
     pub acceptance_profiles: Vec<String>,
+    #[serde(default)]
+    pub acceptance_profile_configs: std::collections::BTreeMap<String, AcceptanceProfileConfig>,
 }
 
 impl CentralConfig {
@@ -140,6 +149,22 @@ impl CentralConfig {
                 return Err(StoreError::Invalid(format!(
                     "repo {id}: bare_path must be absolute"
                 )));
+            }
+            for (profile_name, profile_cfg) in &r.acceptance_profile_configs {
+                if profile_cfg.test_cmd.trim().is_empty() {
+                    return Err(StoreError::Invalid(format!(
+                        "repo {id}: acceptance profile {profile_name} test_cmd must not be empty"
+                    )));
+                }
+                // allowed_paths can be empty (means no restriction)
+            }
+            // Ensure every profile in acceptance_profiles has a config
+            for profile_name in &r.acceptance_profiles {
+                if !r.acceptance_profile_configs.contains_key(profile_name) {
+                    return Err(StoreError::Invalid(format!(
+                        "repo {id}: acceptance profile {profile_name} listed but no config found"
+                    )));
+                }
             }
         }
         Ok(())
@@ -257,7 +282,9 @@ impl Store {
     /// In-memory database (for tests and ephemeral uses).
     pub fn in_memory() -> StoreResult<Store> {
         let conn = Connection::open_in_memory()?;
-        let s = Store { conn: refcell::RefCellConn(std::sync::Mutex::new(conn)) };
+        let s = Store {
+            conn: refcell::RefCellConn(std::sync::Mutex::new(conn)),
+        };
         s.migrate()?;
         Ok(s)
     }
@@ -267,14 +294,18 @@ impl Store {
         // Concurrent writers (multi-connection tests, operator CLI inspection)
         // must wait for the write lock instead of failing with SQLITE_BUSY.
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-        let s = Store { conn: refcell::RefCellConn(std::sync::Mutex::new(conn)) };
+        let s = Store {
+            conn: refcell::RefCellConn(std::sync::Mutex::new(conn)),
+        };
         s.migrate()?;
         Ok(s)
     }
 
     /// Idempotent migration with foreign keys on.
     pub fn migrate(&self) -> StoreResult<()> {
-        self.conn.borrow_mut().execute_batch("PRAGMA foreign_keys = ON;")?;
+        self.conn
+            .borrow_mut()
+            .execute_batch("PRAGMA foreign_keys = ON;")?;
         self.conn.borrow_mut().execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS requests (
@@ -425,7 +456,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS repo_registry (
                 name TEXT PRIMARY KEY,
                 bare_path TEXT NOT NULL,
-                profiles TEXT NOT NULL DEFAULT '[]'
+                profiles TEXT NOT NULL DEFAULT '[]',
+                profile_configs TEXT NOT NULL DEFAULT '{}'
             );
             "#,
         )?;
@@ -535,7 +567,10 @@ impl Store {
         body_digest: &str,
         response: Option<&str>,
     ) -> StoreResult<Option<String>> {
-        let row: Option<(String, Option<String>)> = self.conn.borrow().query_row(
+        let row: Option<(String, Option<String>)> = self
+            .conn
+            .borrow()
+            .query_row(
                 "SELECT body_digest, response FROM idem_writes WHERE subject=?1 AND idem_key=?2",
                 params![subject, idem_key],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
@@ -555,7 +590,12 @@ impl Store {
         Ok(None)
     }
 
-    pub fn idem_store_response(&self, subject: &str, idem_key: &str, response: &str) -> StoreResult<()> {
+    pub fn idem_store_response(
+        &self,
+        subject: &str,
+        idem_key: &str,
+        response: &str,
+    ) -> StoreResult<()> {
         self.conn.borrow_mut().execute(
             "UPDATE idem_writes SET response=?3 WHERE subject=?1 AND idem_key=?2",
             params![subject, idem_key, response],
@@ -607,13 +647,7 @@ impl Store {
              VALUES (?1, 'operator', ?2, ?3, 'plan_request', ?4, 'queued')",
             params![msg_id.as_str(), planner_target(&tx)?, request_id.as_str(), body.to_string()],
         )?;
-        Self::append_event_tx(
-            &tx,
-            request_id.as_str(),
-            "request.created",
-            operator,
-            &body,
-        )?;
+        Self::append_event_tx(&tx, request_id.as_str(), "request.created", operator, &body)?;
         tx.commit()?;
         Ok(())
     }
@@ -670,8 +704,13 @@ impl Store {
     ) -> StoreResult<ValidatedPlan> {
         let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
-        let (state, caps_json, routes_json, planner_binding): (String, String, String, Option<String>) =
-            tx.query_row(
+        let (state, caps_json, routes_json, planner_binding): (
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = tx
+            .query_row(
                 "SELECT state, required_capabilities, required_routes, planner_session
                  FROM requests WHERE request_id=?1",
                 params![request_id],
@@ -715,12 +754,7 @@ impl Store {
                 .unwrap_or_default()
             }),
         };
-        let validated = validate(
-            plan,
-            &required_capabilities,
-            &required_routes,
-            &ctx,
-        )?;
+        let validated = validate(plan, &required_capabilities, &required_routes, &ctx)?;
 
         for t in &validated.plan.tasks {
             tx.execute(
@@ -770,7 +804,13 @@ impl Store {
             "UPDATE requests SET state='blocked', reason=?2 WHERE request_id=?1 AND state='planning'",
             params![request_id, reason],
         )?;
-        Self::append_event_tx(&tx, request_id, "request.blocked", subject, &json!({"reason": reason}))?;
+        Self::append_event_tx(
+            &tx,
+            request_id,
+            "request.blocked",
+            subject,
+            &json!({"reason": reason}),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -840,7 +880,10 @@ impl Store {
     }
 
     pub fn get_planner_binding(&self, planner_node: &str) -> StoreResult<Option<String>> {
-        Ok(self.conn.borrow().query_row(
+        Ok(self
+            .conn
+            .borrow()
+            .query_row(
                 "SELECT session_id FROM planner_binding WHERE planner_node=?1",
                 params![planner_node],
                 |r| r.get(0),
@@ -880,8 +923,15 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_node(&self, node_id: &str, offline_after_seconds: i64) -> StoreResult<Option<NodeView>> {
-        let row = self.conn.borrow().query_row(
+    pub fn get_node(
+        &self,
+        node_id: &str,
+        offline_after_seconds: i64,
+    ) -> StoreResult<Option<NodeView>> {
+        let row = self
+            .conn
+            .borrow()
+            .query_row(
                 "SELECT node_id, role, capabilities, capacity, last_heartbeat, repo_refs
                  FROM nodes WHERE node_id=?1",
                 params![node_id],
@@ -916,8 +966,7 @@ impl Store {
         // BEGIN IMMEDIATE: acquire the write lock upfront so that concurrent
         // claimers serialize (upgrade-deadlock would otherwise return
         // SQLITE_BUSY immediately, bypassing busy_timeout).
-        let tx = conn_mut
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = conn_mut.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // Refresh active run counts for this node.
         let active: i64 = tx.query_row(
             "SELECT COUNT(*) FROM runs r JOIN nodes n ON r.node_id = n.node_id
@@ -1031,7 +1080,10 @@ impl Store {
         Ok(None)
     }
 
-    fn dependency_states_tx(tx: &Transaction<'_>, depends_on: &[String]) -> StoreResult<Vec<TaskState>> {
+    fn dependency_states_tx(
+        tx: &Transaction<'_>,
+        depends_on: &[String],
+    ) -> StoreResult<Vec<TaskState>> {
         let mut out = Vec::new();
         for dep in depends_on {
             let state: String = tx
@@ -1088,25 +1140,23 @@ impl Store {
     ) -> StoreResult<i64> {
         let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
-        let (run_node, gen, state): (String, i64, String) = tx.query_row(
-            "SELECT node_id, lease_generation, state FROM runs WHERE run_id=?1",
-            params![run_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
-        let lease_expires: Option<i64> = tx
+        let (run_node, gen, state): (String, i64, String) = tx
             .query_row(
-                "SELECT lease_expires_at FROM runs WHERE run_id=?1",
+                "SELECT node_id, lease_generation, state FROM runs WHERE run_id=?1",
                 params![run_id],
-                |r| r.get(0),
-            )?;
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
+        let lease_expires: Option<i64> = tx.query_row(
+            "SELECT lease_expires_at FROM runs WHERE run_id=?1",
+            params![run_id],
+            |r| r.get(0),
+        )?;
         let expired = lease_expires.map(|t| t < Self::now()).unwrap_or(true);
         domain::sched::lease_write_allowed(&run_node, gen, node_id, lease_generation, expired)
             .map_err(|e| StoreError::Conflict(e.to_string()))?;
-        if run_is_terminal(
-            serde_json::from_value(json!(state)).unwrap_or(RunState::Failed),
-        ) {
+        if run_is_terminal(serde_json::from_value(json!(state)).unwrap_or(RunState::Failed)) {
             return Err(StoreError::Invalid(format!("run {run_id} is terminal")));
         }
         let new_expiry = Self::now() + lease_seconds;
@@ -1132,19 +1182,19 @@ impl Store {
     ) -> StoreResult<()> {
         let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
-        let (run_node, gen, state_str): (String, i64, String) = tx.query_row(
-            "SELECT node_id, lease_generation, state FROM runs WHERE run_id=?1",
-            params![run_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
-        let lease_expires: Option<i64> = tx
+        let (run_node, gen, state_str): (String, i64, String) = tx
             .query_row(
-                "SELECT lease_expires_at FROM runs WHERE run_id=?1",
+                "SELECT node_id, lease_generation, state FROM runs WHERE run_id=?1",
                 params![run_id],
-                |r| r.get(0),
-            )?;
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
+        let lease_expires: Option<i64> = tx.query_row(
+            "SELECT lease_expires_at FROM runs WHERE run_id=?1",
+            params![run_id],
+            |r| r.get(0),
+        )?;
         let expired = lease_expires.map(|t| t < Self::now()).unwrap_or(true);
         domain::sched::lease_write_allowed(&run_node, gen, node_id, lease_generation, expired)
             .map_err(|e| StoreError::Conflict(e.to_string()))?;
@@ -1182,7 +1232,11 @@ impl Store {
         let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let state_str: String = tx
-            .query_row("SELECT state FROM runs WHERE run_id=?1", params![run_id], |r| r.get(0))
+            .query_row(
+                "SELECT state FROM runs WHERE run_id=?1",
+                params![run_id],
+                |r| r.get(0),
+            )
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
         let from: RunState = serde_json::from_value(json!(state_str))
@@ -1220,7 +1274,11 @@ impl Store {
         let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let state_str: String = tx
-            .query_row("SELECT state FROM runs WHERE run_id=?1", params![run_id], |r| r.get(0))
+            .query_row(
+                "SELECT state FROM runs WHERE run_id=?1",
+                params![run_id],
+                |r| r.get(0),
+            )
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
         let from: RunState = serde_json::from_value(json!(state_str))
@@ -1270,13 +1328,14 @@ impl Store {
     pub fn retry_task(&self, task_id: &str, subject: &str) -> StoreResult<()> {
         let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
-        let (state, _reason): (String, Option<String>) = tx.query_row(
-            "SELECT state, reason FROM tasks WHERE task_id=?1",
-            params![task_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+        let (state, _reason): (String, Option<String>) = tx
+            .query_row(
+                "SELECT state, reason FROM tasks WHERE task_id=?1",
+                params![task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
         let from: TaskState = serde_json::from_value(json!(state))
             .map_err(|_| StoreError::Invalid(format!("bad task state {state}")))?;
         // Old run must not be active (uncertain blocks until resolved).
@@ -1316,13 +1375,14 @@ impl Store {
         let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         // Reviewed run must exist and be an execute run with a bound SHA.
-        let (bound_sha, _exec_state): (Option<String>, String) = tx.query_row(
-            "SELECT candidate_sha, state FROM runs WHERE run_id=?1 AND run_type='execute'",
-            params![reviewed_run_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::NotFound(format!("run {reviewed_run_id}")))?;
+        let (bound_sha, _exec_state): (Option<String>, String) = tx
+            .query_row(
+                "SELECT candidate_sha, state FROM runs WHERE run_id=?1 AND run_type='execute'",
+                params![reviewed_run_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("run {reviewed_run_id}")))?;
         let bound = bound_sha
             .ok_or_else(|| StoreError::Invalid("execute run has no bound candidate SHA".into()))?;
         if bound != candidate_sha {
@@ -1430,16 +1490,20 @@ impl Store {
         let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         // Guard: run must exist and be an execute run still active.
-        let (run_task, run_node, gen, state_str): (String, String, i64, String) = tx.query_row(
-            "SELECT task_id, node_id, lease_generation, state FROM runs
+        let (run_task, run_node, gen, state_str): (String, String, i64, String) = tx
+            .query_row(
+                "SELECT task_id, node_id, lease_generation, state FROM runs
              WHERE run_id=?1 AND run_type='execute'",
+                params![run_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
+        let lease_expires: Option<i64> = tx.query_row(
+            "SELECT lease_expires_at FROM runs WHERE run_id=?1",
             params![run_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
-        let lease_expires: Option<i64> = tx
-            .query_row("SELECT lease_expires_at FROM runs WHERE run_id=?1", params![run_id], |r| r.get(0))?;
+            |r| r.get(0),
+        )?;
         let expired = lease_expires.map(|t| t < Self::now()).unwrap_or(true);
         // Only the lease holder (the run's own node) may finish it, with a
         // matching generation; expired holders get a conflict.
@@ -1490,7 +1554,11 @@ impl Store {
 
     /// Control node claims the oldest queued review run assigned to it.
     /// Returns the review run plus the reviewed execute run and candidate SHA.
-    pub fn claim_review(&self, planner_node: &str, subject: &str) -> StoreResult<Option<(RunRow, RunRow)>> {
+    pub fn claim_review(
+        &self,
+        planner_node: &str,
+        subject: &str,
+    ) -> StoreResult<Option<(RunRow, RunRow)>> {
         let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let review: Option<RunRow> = {
@@ -1537,7 +1605,6 @@ impl Store {
         tx.commit()?;
         Ok(Some((review, execute)))
     }
-
 
     pub fn create_message(
         &self,
@@ -1603,7 +1670,13 @@ impl Store {
                 ],
             )?;
         }
-        Self::append_event_tx(&tx, message_id.as_str(), "message.queued", from_subject, &json!({}))?;
+        Self::append_event_tx(
+            &tx,
+            message_id.as_str(),
+            "message.queued",
+            from_subject,
+            &json!({}),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1619,7 +1692,11 @@ impl Store {
         let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
         let state: String = tx
-            .query_row("SELECT state FROM messages WHERE message_id=?1", params![message_id], |r| r.get(0))
+            .query_row(
+                "SELECT state FROM messages WHERE message_id=?1",
+                params![message_id],
+                |r| r.get(0),
+            )
             .optional()?
             .ok_or_else(|| StoreError::NotFound(format!("message {message_id}")))?;
         let from: MessageState = serde_json::from_value(json!(state))
@@ -1628,7 +1705,10 @@ impl Store {
         let ts = Self::now();
         match to {
             MessageState::Admitted => {
-                tx.execute("UPDATE messages SET state='admitted' WHERE message_id=?1", params![message_id])?;
+                tx.execute(
+                    "UPDATE messages SET state='admitted' WHERE message_id=?1",
+                    params![message_id],
+                )?;
             }
             MessageState::Delivered => {
                 tx.execute(
@@ -1713,7 +1793,13 @@ impl Store {
                 run_ref
             ],
         )?;
-        Self::append_event_tx(&tx, run_id, "evidence.added", source, &json!({"rel_path": rel_path}))?;
+        Self::append_event_tx(
+            &tx,
+            run_id,
+            "evidence.added",
+            source,
+            &json!({"rel_path": rel_path}),
+        )?;
         tx.commit()?;
         Ok(id)
     }
@@ -1721,9 +1807,14 @@ impl Store {
     pub fn get_evidence_for_run(&self, run_id: &str, name: &str) -> StoreResult<(String, String)> {
         // name is the rel_path; enforce canonical relative path.
         if name.contains("..") || name.starts_with('/') {
-            return Err(StoreError::Invalid("evidence path traversal rejected".into()));
+            return Err(StoreError::Invalid(
+                "evidence path traversal rejected".into(),
+            ));
         }
-        let (path, sha): (String, String) = self.conn.borrow().query_row(
+        let (path, sha): (String, String) = self
+            .conn
+            .borrow()
+            .query_row(
                 "SELECT rel_path, sha256 FROM evidence WHERE run_id=?1 AND rel_path=?2",
                 params![run_id, name],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1739,13 +1830,14 @@ impl Store {
     pub fn recover_run(&self, run_id: &str, node_id: &str) -> StoreResult<()> {
         let mut conn_mut = self.conn.borrow_mut();
         let tx = conn_mut.transaction()?;
-        let (run_node, state_str): (String, String) = tx.query_row(
-            "SELECT node_id, state FROM runs WHERE run_id=?1",
-            params![run_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
+        let (run_node, state_str): (String, String) = tx
+            .query_row(
+                "SELECT node_id, state FROM runs WHERE run_id=?1",
+                params![run_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
         if run_node != node_id {
             return Err(StoreError::Domain(DomainError::Forbidden(
                 "recover requested by non-owning node".into(),
@@ -1756,7 +1848,9 @@ impl Store {
         // Only uncertain (or expired-lease) runs need recovery; a fresh lease
         // on an active run is a conflict.
         if !run_is_active(from) {
-            return Err(StoreError::Conflict(format!("run {run_id} not recoverable")));
+            return Err(StoreError::Conflict(format!(
+                "run {run_id} not recoverable"
+            )));
         }
         if from == RunState::Uncertain {
             run_transition(from, RunState::Leased)?;
@@ -1766,19 +1860,15 @@ impl Store {
                 lease_expires_at=?2 WHERE run_id=?1",
             params![run_id, Self::now() + 30],
         )?;
-        Self::append_event_tx(
-            &tx,
-            run_id,
-            "run.recovery_lease",
-            node_id,
-            &json!({}),
-        )?;
+        Self::append_event_tx(&tx, run_id, "run.recovery_lease", node_id, &json!({}))?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn get_message(&self, message_id: &str) -> StoreResult<MessageRow> {
-        self.conn.borrow().query_row(
+        self.conn
+            .borrow()
+            .query_row(
                 "SELECT message_id, from_subject, target_node, target_session, request_id,
                         task_id, kind, body, state
                  FROM messages WHERE message_id=?1",
@@ -1855,7 +1945,7 @@ impl Store {
         let mut out = json!({"resources": [], "routes": []});
         {
             let conn_ref = self.conn.borrow();
-        let mut stmt = conn_ref.prepare(
+            let mut stmt = conn_ref.prepare(
                 "SELECT resource_id, kind, owner_node, version, visibility, observed_at,
                         valid_seconds, credential_ref FROM resources",
             )?;
@@ -1876,7 +1966,7 @@ impl Store {
         }
         if subject != "operator" {
             let conn_ref = self.conn.borrow();
-        let mut stmt = conn_ref.prepare(
+            let mut stmt = conn_ref.prepare(
                 "SELECT resource_id, source_node, observed_at, valid_seconds FROM routes
                  WHERE source_node=?1",
             )?;
@@ -1898,11 +1988,22 @@ impl Store {
 
     // ---------- Repo registry (for plan validation) ----------
 
-    pub fn register_repo(&self, name: &str, bare_path: &str, profiles: &[String]) -> StoreResult<()> {
+    pub fn register_repo(
+        &self,
+        name: &str,
+        bare_path: &str,
+        profiles: &[String],
+        profile_configs: &std::collections::BTreeMap<String, AcceptanceProfileConfig>,
+    ) -> StoreResult<()> {
         self.conn.borrow_mut().execute(
-            "INSERT INTO repo_registry (name, bare_path, profiles) VALUES (?1, ?2, ?3)
-             ON CONFLICT(name) DO UPDATE SET bare_path=?2, profiles=?3",
-            params![name, bare_path, serde_json::to_string(profiles).unwrap()],
+            "INSERT INTO repo_registry (name, bare_path, profiles, profile_configs) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(name) DO UPDATE SET bare_path=?2, profiles=?3, profile_configs=?4",
+            params![
+                name,
+                bare_path,
+                serde_json::to_string(profiles).unwrap(),
+                serde_json::to_string(profile_configs).unwrap()
+            ],
         )?;
         Ok(())
     }
@@ -1940,7 +2041,9 @@ impl Store {
     }
 
     pub fn get_run(&self, run_id: &str) -> StoreResult<RunRow> {
-        self.conn.borrow().query_row(
+        self.conn
+            .borrow()
+            .query_row(
                 "SELECT run_id, task_id, run_type, attempt, node_id, session_id,
                         lease_generation, lease_expires_at, candidate_sha, state
                  FROM runs WHERE run_id=?1",
@@ -2038,7 +2141,11 @@ fn planner_target(tx: &Transaction<'_>) -> StoreResult<String> {
     // The planning message targets the configured planner node. If the
     // planner_binding table knows a node use it; otherwise default 'control'.
     let known: Option<String> = tx
-        .query_row("SELECT planner_node FROM planner_binding LIMIT 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT planner_node FROM planner_binding LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
         .optional()?;
     Ok(known.unwrap_or_else(|| "control".to_string()))
 }

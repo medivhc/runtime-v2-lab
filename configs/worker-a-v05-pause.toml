@@ -11,6 +11,7 @@ runner_dir = "/root/workspace/runtime-v2-lab/worker-a/runner"
 work_root = "/root/workspace/runtime-v2-lab/worker-a/work"
 poll_seconds = 2
 heartbeat_seconds = 5
+central_config_path = "/root/workspace/runtime-v2-lab/configs/central.toml"
 
 # V05: pause right after prompt delivery, before the center records prompt_admitted
 test_pause_after_prompt = true

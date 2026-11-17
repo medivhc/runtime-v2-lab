@@ -24,4 +24,11 @@ token_env = "RUNTIME_WORKER_B_TOKEN"
 
 [repositories.fixture]
 bare_path = "/root/workspace/runtime-v2-lab/fixture.git"
-acceptance_profiles = ["counter-v1"]
+
+[repositories.fixture.acceptance_profiles.counter-v1]
+test_cmd = "python3 -m unittest -v test_counter"
+allowed_paths = ["counter.py", "test_counter.py"]
+
+[repositories.fixture.acceptance_profiles.service-v1]
+test_cmd = "cargo fmt --check && cargo clippy -- -D warnings && cargo test"
+allowed_paths = ["scripts/**", "crates/service/**", "crates/runtime/src/main.rs"]

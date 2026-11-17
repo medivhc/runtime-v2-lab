@@ -197,12 +197,9 @@ mod tests {
     fn ctx() -> PlanContext {
         PlanContext {
             repos: ["fixture".to_string()].into_iter().collect(),
-            acceptance_profiles: [(
-                "fixture".to_string(),
-                vec!["counter-v1".to_string()],
-            )]
-            .into_iter()
-            .collect(),
+            acceptance_profiles: [("fixture".to_string(), vec!["counter-v1".to_string()])]
+                .into_iter()
+                .collect(),
             submitted_by_node: Some("control".to_string()),
             planner_binding: Some("control".to_string()),
         }

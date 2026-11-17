@@ -119,7 +119,10 @@ impl OcClient {
     pub async fn info(&self) -> OcResult<String> {
         let resp = self.get("/api/info").await?;
         let status = resp.status();
-        let v: serde_json::Value = resp.json().await.map_err(|e| OcError(format!("info json: {e}")))?;
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| OcError(format!("info json: {e}")))?;
         if !status.is_success() {
             return Err(OcError(format!("info HTTP {status}")));
         }
@@ -156,9 +159,7 @@ impl OcClient {
     /// Cross-node access yields 404; here mapped to Ok(None) for the
     /// "not found on this node" case only.
     pub async fn get_session(&self, session_id: &str) -> OcResult<Option<SessionRef>> {
-        let resp = self
-            .get(&format!("/api/session/{session_id}"))
-            .await?;
+        let resp = self.get(&format!("/api/session/{session_id}")).await?;
         match resp.status() {
             s if s.is_success() => {
                 let v: serde_json::Value = resp
@@ -265,7 +266,9 @@ impl OcClient {
         if !status.is_success() {
             return Err(OcError(format!("inbox HTTP {status}")));
         }
-        resp.json().await.map_err(|e| OcError(format!("inbox json: {e}")))
+        resp.json()
+            .await
+            .map_err(|e| OcError(format!("inbox json: {e}")))
     }
 }
 
@@ -305,7 +308,11 @@ mod tests {
                     }
                     let req_str = String::from_utf8_lossy(&req);
                     let first_line = req_str.lines().next().unwrap_or("");
-                    let path = first_line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let path = first_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
                     let path = path.split('?').next().unwrap_or("/").to_string();
 
                     // Auth check (header name case-insensitive)
@@ -321,7 +328,9 @@ mod tests {
                         let authed = lower.contains("authorization: basic") && !wrong_cred;
                         if !authed {
                             stream
-                                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                                .write_all(
+                                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+                                )
                                 .unwrap();
                             continue;
                         }

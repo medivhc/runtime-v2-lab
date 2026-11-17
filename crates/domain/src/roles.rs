@@ -36,8 +36,7 @@ pub fn authorized(role: Role, action: Action) -> bool {
     match (role, action) {
         // Operator can create goals, query evidence, resolve uncertain runs,
         // retry tasks after closing old attempts.
-        (Operator, OperatorAction)
-        | (Operator, ReadResource) => true,
+        (Operator, OperatorAction) | (Operator, ReadResource) => true,
         // Control writes plans, reviews, bindings; acks own messages.
         // UpdateRun covers advancing its own claimed review runs to their
         // terminal state after submission (control owns review runs).

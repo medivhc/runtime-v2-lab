@@ -148,7 +148,9 @@ pub fn retry_allowed(old_run_state: Option<crate::state::RunState>) -> bool {
     match old_run_state {
         None => true,
         Some(s) => {
-            !run_is_active(s) && (task_is_final(TaskState::Failed) || true) && crate::state::run_is_terminal(s)
+            !run_is_active(s)
+                && (task_is_final(TaskState::Failed) || true)
+                && crate::state::run_is_terminal(s)
         }
     }
 }

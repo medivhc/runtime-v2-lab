@@ -20,10 +20,17 @@ fn plan_task(key: &str, deps: &[&str]) -> PlanTask {
     }
 }
 
+use std::collections::BTreeMap;
+
 fn setup_store() -> Store {
     let s = Store::in_memory().unwrap();
-    s.register_repo("fixture", "/tmp/fixture.git", &["counter-v1".into()])
-        .unwrap();
+    s.register_repo(
+        "fixture",
+        "/tmp/fixture.git",
+        &["counter-v1".into()],
+        &BTreeMap::new(),
+    )
+    .unwrap();
     s
 }
 
@@ -40,8 +47,16 @@ fn setup_node(s: &Store, node_id: &str, caps: &[&str]) {
 
 fn make_request(s: &Store) -> String {
     let rid = RequestId::new(format!("req-{}", uuid_like()));
-    s.create_request(&rid, "fix counter", "fixture", "base123", &["fixture-exec".into()], &[], "operator")
-        .unwrap();
+    s.create_request(
+        &rid,
+        "fix counter",
+        "fixture",
+        "base123",
+        &["fixture-exec".into()],
+        &[],
+        "operator",
+    )
+    .unwrap();
     rid.to_string()
 }
 
@@ -102,7 +117,10 @@ fn claim_transaction_single_winner() {
     let first = s.claim_execute(&node_a, &[], "worker-a").unwrap();
     assert!(first.is_some(), "worker-a should claim the queued task");
     let second = s.claim_execute(&node_b, &[], "worker-b").unwrap();
-    assert!(second.is_none(), "task already claimed; worker-b must get none");
+    assert!(
+        second.is_none(),
+        "task already claimed; worker-b must get none"
+    );
 
     let tasks = s.tasks_for_request(&rid).unwrap();
     assert_eq!(tasks[0].state, "running");
@@ -114,7 +132,13 @@ fn concurrent_claim_two_connections_only_one_wins() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.sqlite");
     let s = Store::open(db_path.to_str().unwrap()).unwrap();
-    s.register_repo("fixture", "/tmp/fixture.git", &["counter-v1".into()]).unwrap();
+    s.register_repo(
+        "fixture",
+        "/tmp/fixture.git",
+        &["counter-v1".into()],
+        &BTreeMap::new(),
+    )
+    .unwrap();
     let rid = make_request(&s);
     submit_plan(&s, &rid, vec![plan_task("t1", &[])]);
     setup_node(&s, "worker-a", &["fixture-exec"]);
@@ -169,7 +193,10 @@ fn failed_state_transition_rolls_back_completely() {
         None,
         "worker-a",
     );
-    assert!(matches!(res2, Err(StoreError::Invalid(_)) | Err(StoreError::Domain(_))));
+    assert!(matches!(
+        res2,
+        Err(StoreError::Invalid(_)) | Err(StoreError::Domain(_))
+    ));
 
     // Task state is still running (run finished does not accept the task);
     // the failed double-finish must not have altered it.
@@ -182,15 +209,45 @@ fn failed_state_transition_rolls_back_completely() {
 fn idempotent_message_same_key_same_body_ok_different_body_rejected() {
     let s = setup_store();
     let mid = MessageId::new("msg-1");
-    s.create_message(&mid, "control", Some("worker-a"), None, None, None, "info", "body-v1", Some("idem-1"))
-        .unwrap();
+    s.create_message(
+        &mid,
+        "control",
+        Some("worker-a"),
+        None,
+        None,
+        None,
+        "info",
+        "body-v1",
+        Some("idem-1"),
+    )
+    .unwrap();
     // Same key same body: ok (returns existing).
     let mid2 = MessageId::new("msg-2");
-    s.create_message(&mid2, "control", Some("worker-a"), None, None, None, "info", "body-v1", Some("idem-1"))
-        .unwrap();
+    s.create_message(
+        &mid2,
+        "control",
+        Some("worker-a"),
+        None,
+        None,
+        None,
+        "info",
+        "body-v1",
+        Some("idem-1"),
+    )
+    .unwrap();
     // Same key different body: rejected.
     let mid3 = MessageId::new("msg-3");
-    let res = s.create_message(&mid3, "control", Some("worker-a"), None, None, None, "info", "body-v2", Some("idem-1"));
+    let res = s.create_message(
+        &mid3,
+        "control",
+        Some("worker-a"),
+        None,
+        None,
+        None,
+        "info",
+        "body-v2",
+        Some("idem-1"),
+    );
     assert!(matches!(res, Err(StoreError::IdempotencyConflict)));
 }
 
@@ -208,10 +265,23 @@ fn lease_conflict_on_stale_generation() {
     let res = s.renew_lease(&run.run_id, "worker-a", 99, 30, "worker-a");
     assert!(matches!(res, Err(StoreError::Conflict(_))));
     // Wrong node -> conflict.
-    let res = s.renew_lease(&run.run_id, "worker-b", run.lease_generation, 30, "worker-b");
+    let res = s.renew_lease(
+        &run.run_id,
+        "worker-b",
+        run.lease_generation,
+        30,
+        "worker-b",
+    );
     assert!(matches!(res, Err(StoreError::Conflict(_))));
     // Correct generation + node -> ok.
-    s.renew_lease(&run.run_id, "worker-a", run.lease_generation, 30, "worker-a").unwrap();
+    s.renew_lease(
+        &run.run_id,
+        "worker-a",
+        run.lease_generation,
+        30,
+        "worker-a",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -223,14 +293,16 @@ fn uncertain_run_blocks_retry_until_resolved() {
     let mut node = s.get_node("worker-a", 15).unwrap().unwrap();
     node.seconds_since_heartbeat = 0;
     let (task, run) = s.claim_execute(&node, &[], "worker-a").unwrap().unwrap();
-    s.mark_uncertain(&run.run_id, "cannot confirm", "worker-a").unwrap();
+    s.mark_uncertain(&run.run_id, "cannot confirm", "worker-a")
+        .unwrap();
 
     // Retry must be rejected while uncertain.
     let res = s.retry_task(&task.task_id, "operator");
     assert!(matches!(res, Err(StoreError::Conflict(_))));
 
     // Operator resolves by closing the old attempt; retry then succeeds.
-    s.resolve_run(&run.run_id, true, "closed by operator", "operator").unwrap();
+    s.resolve_run(&run.run_id, true, "closed by operator", "operator")
+        .unwrap();
     s.retry_task(&task.task_id, "operator").unwrap();
     let t = s.get_task(&task.task_id).unwrap();
     assert_eq!(t.state, "queued");
@@ -251,7 +323,8 @@ fn resolve_close_from_running_reopens_task_for_retry() {
     assert_eq!(s.get_task(&task.task_id).unwrap().state, "running");
 
     // Operator closes the orphaned run; the task must follow to canceled…
-    s.resolve_run(&run.run_id, true, "sandbox reset orphaned run", "operator").unwrap();
+    s.resolve_run(&run.run_id, true, "sandbox reset orphaned run", "operator")
+        .unwrap();
     let t = s.get_task(&task.task_id).unwrap();
     assert_eq!(t.state, "canceled");
     // …and retry must then be a legal transition back to queued.
@@ -271,8 +344,13 @@ fn review_rejects_mismatched_candidate_sha() {
     let (task, run) = s.claim_execute(&node, &[], "worker-a").unwrap().unwrap();
     // Bind candidate SHA on the execute run.
     s.advance_run(
-        &run.run_id, "worker-a", run.lease_generation,
-        domain::state::RunState::Finished, None, Some("abc123"), "worker-a",
+        &run.run_id,
+        "worker-a",
+        run.lease_generation,
+        domain::state::RunState::Finished,
+        None,
+        Some("abc123"),
+        "worker-a",
     )
     .unwrap();
     // The review run itself must exist (foreign key) — create one via a
@@ -288,9 +366,12 @@ fn review_rejects_mismatched_candidate_sha() {
         "INSERT INTO runs (run_id, task_id, run_type, attempt, node_id, lease_generation, state)
          VALUES ('run-review-1', ?1, 'review', 1, 'worker-a', 1, 'leased')",
         &[&task.task_id],
-    ).unwrap();
+    )
+    .unwrap();
     // Review with right SHA and exit 0 -> pass, task accepted.
-    let verdict = s.submit_review("run-review-1", &run.run_id, "abc123", 0, "pass", "control").unwrap();
+    let verdict = s
+        .submit_review("run-review-1", &run.run_id, "abc123", 0, "pass", "control")
+        .unwrap();
     assert_eq!(verdict, "pass");
     let t = s.get_task(&task.task_id).unwrap();
     assert_eq!(t.state, "accepted");
@@ -315,7 +396,10 @@ fn planner_binding_rebind_requires_operator() {
     let s = setup_store();
     s.bind_planner("control", "ses-1", "control").unwrap();
     // Same binding idempotent.
-    assert_eq!(s.bind_planner("control", "ses-1", "control").unwrap(), "ses-1");
+    assert_eq!(
+        s.bind_planner("control", "ses-1", "control").unwrap(),
+        "ses-1"
+    );
     // Changing -> conflict (operator must resolve).
     let res = s.bind_planner("control", "ses-2", "control");
     assert!(matches!(res, Err(StoreError::Conflict(_))));
@@ -370,7 +454,13 @@ fn v04_barrier_two_workers_same_task_one_active_run_invalid_lease_409() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("v04.sqlite");
     let s = Store::open(db_path.to_str().unwrap()).unwrap();
-    s.register_repo("fixture", "/tmp/fixture.git", &["counter-v1".into()]).unwrap();
+    s.register_repo(
+        "fixture",
+        "/tmp/fixture.git",
+        &["counter-v1".into()],
+        &BTreeMap::new(),
+    )
+    .unwrap();
     let rid = make_request(&s);
     submit_plan(&s, &rid, vec![plan_task("t1", &[])]);
     setup_node(&s, "worker-a", &["fixture-exec"]);
