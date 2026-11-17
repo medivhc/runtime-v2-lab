@@ -3,6 +3,7 @@
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
+use urlencoding::encode;
 
 mod runner;
 
@@ -189,28 +190,52 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         Cmd::Evidence { run, out } => {
-            // Downloads every registered evidence file for the run.
-            let v = api_get(&format!("/v1/runs/{run}"))
-                .await
-                .unwrap_or(json!({}));
+            // Download known evidence files for the run.
+            // The runner registers two evidence files with predictable rel_paths:
+            // {run}/patch.diff (name="patch") and {run}/git.log (name="git-log").
+            // The download endpoint uses rel_path as the :name parameter.
+            // We must URL-encode the rel_path (single-segment %2F encoding).
             let client = reqwest::Client::new();
             std::fs::create_dir_all(&out)?;
-            if let Some(files) = v["evidence"].as_array() {
-                for f in files {
-                    let name = f["rel_path"].as_str().unwrap_or_default();
-                    let bytes = client
-                        .get(format!("{}/v1/runs/{run}/evidence/{name}", runtime_url()))
-                        .bearer_auth(operator_token()?)
-                        .send()
-                        .await?
-                        .bytes()
-                        .await?;
-                    let path = std::path::Path::new(&out).join(name);
-                    if let Some(p) = path.parent() {
-                        std::fs::create_dir_all(p)?;
-                    }
-                    std::fs::write(path, &bytes)?;
+
+            // Known evidence rel_paths registered by the worker.
+            let evidence_rel_paths = [format!("{run}/patch.diff"), format!("{run}/git.log")];
+
+            let mut any_success = false;
+            for rel_path in &evidence_rel_paths {
+                // Single-segment URL encoding: encode / as %2F
+                let encoded_name = encode(rel_path);
+                let url = format!("{}/v1/runs/{run}/evidence/{encoded_name}", runtime_url());
+                let resp = client
+                    .get(&url)
+                    .bearer_auth(operator_token()?)
+                    .send()
+                    .await?;
+
+                let status = resp.status();
+                if status == 404 {
+                    // Evidence file not registered for this run; skip but don't error
+                    // (some runs may not have both files).
+                    eprintln!("evidence not found: {rel_path} (404)");
+                    continue;
                 }
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("failed to download evidence {rel_path}: HTTP {status}: {body}");
+                }
+
+                let bytes = resp.bytes().await?;
+                let path = std::path::Path::new(&out).join(rel_path);
+                if let Some(p) = path.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                std::fs::write(&path, &bytes)?;
+                eprintln!("downloaded evidence: {rel_path}");
+                any_success = true;
+            }
+
+            if !any_success {
+                anyhow::bail!("no evidence files found for run {run}");
             }
             println!("evidence exported to {out}");
         }
