@@ -93,4 +93,4 @@ Exit code: 1
 ## 提交记录
 - 分支：rt/evidence-1
 - 提交：`git commit -m "fix: evidence CLI list & download path encoding (RT-EVIDENCE-1)"`
-- 提交号：待 push 后填入
+- 提交号：7873055
