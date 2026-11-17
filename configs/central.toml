@@ -24,18 +24,11 @@ token_env = "RUNTIME_WORKER_B_TOKEN"
 
 [repositories.fixture]
 bare_path = "/root/workspace/runtime-v2-lab/fixture.git"
-
-[repositories.fixture.acceptance_profiles.counter-v1]
-test_cmd = "python3 -m unittest -v test_counter"
-allowed_paths = ["counter.py", "test_counter.py"]
-
-[repositories.fixture.acceptance_profiles.service-v1]
-test_cmd = "cargo fmt --check && cargo clippy -- -D warnings && cargo test"
-allowed_paths = ["scripts/**", "crates/service/**", "crates/runtime/src/main.rs"]
+acceptance_profiles = ["counter-v1", "service-v1"]
+acceptance_profile_configs.counter-v1 = { test_cmd = "python3 -m unittest -v test_counter", allowed_paths = ["counter.py", "test_counter.py"] }
+acceptance_profile_configs.service-v1 = { test_cmd = "cargo fmt --check && cargo clippy -- -D warnings && cargo test", allowed_paths = ["scripts/**", "crates/service/**", "crates/runtime/src/main.rs"] }
 
 [repositories.lab]
 bare_path = "/root/workspace/runtime-v2-lab/lab.git"
-
-[repositories.lab.acceptance_profiles.service-v1]
-test_cmd = "cargo fmt --check && cargo test --workspace"
-allowed_paths = ["scripts/**", "crates/**", "configs/**", "docs/**"]
+acceptance_profiles = ["service-v1"]
+acceptance_profile_configs.service-v1 = { test_cmd = "cargo fmt --check && cargo test --workspace", allowed_paths = ["scripts/**", "crates/**", "configs/**", "docs/**"] }
