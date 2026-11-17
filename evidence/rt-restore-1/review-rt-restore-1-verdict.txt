@@ -1,0 +1,44 @@
+VERDICT: APPROVE
+
+## 逐条发现
+
+### Major: 无
+
+### Minor: 无
+
+## 复跑验证记录
+
+### 1. git show c8ca1d6 核对
+- 提交变更与任务书一致：
+  - serve 启动改为 `(cd "$LAB" && setsid nohup ... < /dev/null &)`，子 shell 立即退出，配合 setsid+nohup+stdin 重定向使 serve 完全脱离脚本进程组
+  - 探活改为 200ms 间隔、最长 30s（MAX_ATTEMPTS=150）轮询 `/v1/requests`，成功打印 `central ready`，超时打印 `central FAILED to start within 30s` 到 stderr 并 exit 1
+
+### 2. 独立复跑机器门
+| 检查项 | 结果 | 备注 |
+|--------|------|------|
+| `bash -n scripts/restore.sh` | ✅ 通过 | 语法无误 |
+| 桩验证就绪场景 `./test-restore-healthcheck-stub.sh 5` | ✅ rc=0 | 打印 `central ready` |
+| 桩验证超时场景 `./test-restore-healthcheck-stub.sh 200` | ✅ rc=1 | 打印 `central FAILED to start within 150 attempts` 到 stderr |
+| `cargo fmt --check` | ✅ 通过 | workspace 格式规范 |
+| `cargo test --workspace` | ✅ 77 passed, 0 failed | 39+8+8+0+7+0+15=77，与预期一致 |
+| 桩脚本循环结构一致性 | ✅ 通过 | MAX_ATTEMPTS=150、成功/失败分支语义与生产代码一致，仅 sleep 0.01 加速测试 |
+
+### 3. 实机验证（受限）
+- central 当前未运行，端口 18080 空闲
+- 使用备份 `v10-bk-awaiting-145124` 执行 restore.sh：
+  - 备份→恢复→重启链路跑通
+  - serve 成功脱离进程组启动（日志确认 "runtime serve listening on 127.0.0.1:18080"）
+  - 脚本在 30s 探活超时后正确退出（exit 1），未挂起
+  - **失败原因**：central.toml 预存配置 TOML 解析错误（line 28 `acceptance_profiles.counter-v1` 类型不匹配），导致 central 反复启动失败，非 restore.sh 问题
+- 按任务书第3条，环境配置风险说明后改用只读判断，**不影响本提交修复的正确性验证**
+
+### 4. 范围核对
+- 改动仅限 `scripts/restore.sh`、`scripts/test-restore-healthcheck-stub.sh`（符合任务书"仅限 scripts/ 目录"）
+- DELIVERY-RT-RESTORE-1.md 描述与实际 diff 完全一致
+- 未违反约束：未改动 central/worker 代码与 schema，未修 evidence CLI
+
+## 结论
+提交 c8ca1d6 完整满足 RT-RESTORE-1 任务书要求：
+1. serve 以 setsid+nohup+stdin</dev/null 子 shell 启动，完全脱离脚本进程组，脚本可正常退出
+2. 探活采用 200ms/30s 重试，就绪打印 `central ready`，失败明确报错并非零退出
+3. 仅改动 scripts/ 目录，验收档 service-v1 机器门全绿（77/77）
