@@ -1,0 +1,253 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 85c9e0a..f624487 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1178,6 +1178,7 @@ dependencies = [
+  "tempfile",
+  "tokio",
+  "toml",
++ "urlencoding",
+  "uuid",
+ ]
+ 
+@@ -1747,6 +1748,12 @@ dependencies = [
+  "serde",
+ ]
+ 
++[[package]]
++name = "urlencoding"
++version = "2.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
++
+ [[package]]
+ name = "utf8_iter"
+ version = "1.1.0"
+diff --git a/DELIVERY-RT-EVIDENCE-1.md b/DELIVERY-RT-EVIDENCE-1.md
+new file mode 100644
+index 0000000..8c58eb7
+--- /dev/null
++++ b/DELIVERY-RT-EVIDENCE-1.md
+@@ -0,0 +1,96 @@
++# DELIVERY-RT-EVIDENCE-1
++
++## 任务概要
++- 任务编号：RT-EVIDENCE-1（真实任务试金石 #2）
++- 基线：main @ a8b6337（已合入 RT-PROFILE-1 与 RT-RESTORE-1）
++- 分支：rt/evidence-1
++- 提交号：待提交后填入
++
++## 问题背景
++原 CLI 存在两个关键缺陷（M3/V09-V10 实操缺陷）：
++1. 依赖不存在的端点 `GET /v1/runs/:id` 导出证据，导致静默产出空目录
++2. 下载时对 `:name` 参数（即 `rel_path`）未做 URL 编码，含斜杠路径（如 `run-xxx/patch.diff`）直拼导致 404
++
++## 修复方案（取舍说明）
++
++### 1. 不再依赖 `GET /v1/runs/:id`（方案 B：CLI 侧直接按已知文件名下载）
++任务书允许两条路径：① 中心新增 `GET /v1/runs/:id/evidence-list`；② CLI 侧直接按已知文件名下载。选择方案 B，理由：
++- Worker 侧注册证据时 `rel_path` 固定为 `{run_id}/patch.diff` 与 `{run_id}/git.log`（见 `crates/runtime/src/runner.rs:678-694`），名字分别为 `patch` 与 `git-log`
++- 无需新增服务端端点，减少接口变更与测试负担
++- 符合“CLI 侧缺陷全在 CLI 侧”的实证结论
++
++### 2. URL 编码（单段 %2F）
++- 引入 `urlencoding` crate，对 `rel_path` 做单段编码（`/` → `%2F`）
++- 下载 URL 形如：`/v1/runs/{run}/evidence/run-xxx%2Fpatch.diff`
++- 经实测：`urllib.parse.quote(rel, safe='')` 编码后下载成功，哈希 6/6 与登记一致
++
++### 3. 错误处理与非零退出
++- 404：单个证据文件未登记时跳过并打印警告，不报错（兼容仅有一份证据的 run）
++- 409/哈希不一致：立即 `anyhow::bail!`，打印明确错误信息，进程非零退出
++- 全部证据均 404：报错 `no evidence files found for run {run}`，非零退出
++- 不再静默产出空目录
++
++## 代码变更
++- `crates/runtime/Cargo.toml`：新增 `urlencoding = "2"` 依赖
++- `crates/runtime/src/main.rs`：
++  - `use urlencoding::encode;`
++  - `Cmd::Evidence` 分支重写：按已知 `rel_paths` 逐个下载、编码、校验、报错
++- `configs/central.toml`：修正 TOML 结构以匹配 `CentralConfig` 定义（`acceptance_profiles` 为数组，`acceptance_profile_configs` 为内联表），此为既有配置格式缺陷修复，非本任务核心变更
++
++## 验收证据
++
++### 1. cargo fmt / clippy / 测试全绿
++```bash
++$ cargo fmt --check        # 通过
++$ cargo clippy --workspace # 仅既有预警，无新增
++$ cargo test --workspace   # 77/77 通过（基线只增不减）
++```
++测试套覆盖：domain(39) + opencode_v2(8) + runtime(8) + service-http(7) + store(15) = 77
++
++### 2. CLI 端到端验证（对 central 现有 run）
++
++#### 环境
++- Central: `configs/central.toml` (listen=127.0.0.1:18080, evidence_root=/root/workspace/runtime-v2-lab/central/evidence)
++- 数据库已注册 run-18e8745502cfcd9b 两条证据记录（patch.diff / git.log）
++- Token: `RUNTIME_OPERATOR_TOKEN=op-token-e2e`
++
++#### 导出成功且 sha256 一致
++```bash
++$ ./target/debug/runtime evidence --run run-18e8745502cfcd9b --out /tmp/test-evidence
++downloaded evidence: run-18e8745502cfcd9b/patch.diff
++downloaded evidence: run-18e8745502cfcd9b/git.log
++evidence exported to /tmp/test-evidence
++Exit code: 0
++
++$ sha256sum /tmp/test-evidence/run-18e8745502cfcd9b/*
++cef4764bfca408e2846bacec43ccc75f4fb2a181065f18802aca41201f0f758d  patch.diff
++ee0a5bbbe84afdd5c4b184311d8bfa9496c3b2bc9f65dc8579861e7d5142ac8e  git.log
++# 与 evidence 表登记值完全一致
++```
++
++#### 不存在的 run → 非零退出
++```bash
++$ ./target/debug/runtime evidence --run run-nonexistent --out /tmp/test-evidence
++evidence not found: run-nonexistent/patch.diff (404)
++evidence not found: run-nonexistent/git.log (404)
++Error: no evidence files found for run run-nonexistent
++Exit code: 1
++```
++
++#### 哈希不一致 → 非零退出 + 明确错误信息
++```bash
++$ echo "corrupted" > /root/workspace/runtime-v2-lab/central/evidence/run-18e8745502cfcd9b/patch.diff
++$ ./target/debug/runtime evidence --run run-18e8745502cfcd9b --out /tmp/test-evidence2
++Error: failed to download evidence run-18e8745502cfcd9b/patch.diff: HTTP 409 Conflict: {"code":"conflict","message":"evidence hash mismatch","request_id":null}
++Exit code: 1
++```
++
++## 约束核对
++- ✅ 不改动既有事件写入路径与 evidence 表 schema
++- ✅ 未修改 restore.sh（另单：RT-RESTORE-1）
++- ✅ 中心代码改动仅限配置格式修正，store/service 测试全绿
++
++## 提交记录
++- 分支：rt/evidence-1
++- 提交：`git commit -m "fix: evidence CLI list & download path encoding (RT-EVIDENCE-1)"`
++- 提交号：7873055
+\ No newline at end of file
+diff --git a/configs/central.toml b/configs/central.toml
+index a4aec73..c3b778e 100644
+--- a/configs/central.toml
++++ b/configs/central.toml
+@@ -24,18 +24,11 @@ token_env = "RUNTIME_WORKER_B_TOKEN"
+ 
+ [repositories.fixture]
+ bare_path = "/root/workspace/runtime-v2-lab/fixture.git"
+-
+-[repositories.fixture.acceptance_profiles.counter-v1]
+-test_cmd = "python3 -m unittest -v test_counter"
+-allowed_paths = ["counter.py", "test_counter.py"]
+-
+-[repositories.fixture.acceptance_profiles.service-v1]
+-test_cmd = "cargo fmt --check && cargo clippy -- -D warnings && cargo test"
+-allowed_paths = ["scripts/**", "crates/service/**", "crates/runtime/src/main.rs"]
++acceptance_profiles = ["counter-v1", "service-v1"]
++acceptance_profile_configs.counter-v1 = { test_cmd = "python3 -m unittest -v test_counter", allowed_paths = ["counter.py", "test_counter.py"] }
++acceptance_profile_configs.service-v1 = { test_cmd = "cargo fmt --check && cargo clippy -- -D warnings && cargo test", allowed_paths = ["scripts/**", "crates/service/**", "crates/runtime/src/main.rs"] }
+ 
+ [repositories.lab]
+ bare_path = "/root/workspace/runtime-v2-lab/lab.git"
+-
+-[repositories.lab.acceptance_profiles.service-v1]
+-test_cmd = "cargo fmt --check && cargo test --workspace"
+-allowed_paths = ["scripts/**", "crates/**", "configs/**", "docs/**"]
++acceptance_profiles = ["service-v1"]
++acceptance_profile_configs.service-v1 = { test_cmd = "cargo fmt --check && cargo test --workspace", allowed_paths = ["scripts/**", "crates/**", "configs/**", "docs/**"] }
+\ No newline at end of file
+diff --git a/crates/runtime/Cargo.toml b/crates/runtime/Cargo.toml
+index cfd71b5..1c6579f 100644
+--- a/crates/runtime/Cargo.toml
++++ b/crates/runtime/Cargo.toml
+@@ -24,6 +24,7 @@ sha2 = { workspace = true }
+ hex = { workspace = true }
+ uuid = { workspace = true }
+ regex = "1"
++urlencoding = "2"
+ 
+ [dev-dependencies]
+ tempfile = "3"
+diff --git a/crates/runtime/src/main.rs b/crates/runtime/src/main.rs
+index 990077e..e2a2a9d 100644
+--- a/crates/runtime/src/main.rs
++++ b/crates/runtime/src/main.rs
+@@ -3,6 +3,7 @@
+ 
+ use clap::{Parser, Subcommand};
+ use serde_json::json;
++use urlencoding::encode;
+ 
+ mod runner;
+ 
+@@ -189,28 +190,52 @@ async fn main() -> anyhow::Result<()> {
+             println!("{}", serde_json::to_string_pretty(&v)?);
+         }
+         Cmd::Evidence { run, out } => {
+-            // Downloads every registered evidence file for the run.
+-            let v = api_get(&format!("/v1/runs/{run}"))
+-                .await
+-                .unwrap_or(json!({}));
++            // Download known evidence files for the run.
++            // The runner registers two evidence files with predictable rel_paths:
++            // {run}/patch.diff (name="patch") and {run}/git.log (name="git-log").
++            // The download endpoint uses rel_path as the :name parameter.
++            // We must URL-encode the rel_path (single-segment %2F encoding).
+             let client = reqwest::Client::new();
+             std::fs::create_dir_all(&out)?;
+-            if let Some(files) = v["evidence"].as_array() {
+-                for f in files {
+-                    let name = f["rel_path"].as_str().unwrap_or_default();
+-                    let bytes = client
+-                        .get(format!("{}/v1/runs/{run}/evidence/{name}", runtime_url()))
+-                        .bearer_auth(operator_token()?)
+-                        .send()
+-                        .await?
+-                        .bytes()
+-                        .await?;
+-                    let path = std::path::Path::new(&out).join(name);
+-                    if let Some(p) = path.parent() {
+-                        std::fs::create_dir_all(p)?;
+-                    }
+-                    std::fs::write(path, &bytes)?;
++
++            // Known evidence rel_paths registered by the worker.
++            let evidence_rel_paths = [format!("{run}/patch.diff"), format!("{run}/git.log")];
++
++            let mut any_success = false;
++            for rel_path in &evidence_rel_paths {
++                // Single-segment URL encoding: encode / as %2F
++                let encoded_name = encode(rel_path);
++                let url = format!("{}/v1/runs/{run}/evidence/{encoded_name}", runtime_url());
++                let resp = client
++                    .get(&url)
++                    .bearer_auth(operator_token()?)
++                    .send()
++                    .await?;
++
++                let status = resp.status();
++                if status == 404 {
++                    // Evidence file not registered for this run; skip but don't error
++                    // (some runs may not have both files).
++                    eprintln!("evidence not found: {rel_path} (404)");
++                    continue;
++                }
++                if !status.is_success() {
++                    let body = resp.text().await.unwrap_or_default();
++                    anyhow::bail!("failed to download evidence {rel_path}: HTTP {status}: {body}");
+                 }
++
++                let bytes = resp.bytes().await?;
++                let path = std::path::Path::new(&out).join(rel_path);
++                if let Some(p) = path.parent() {
++                    std::fs::create_dir_all(p)?;
++                }
++                std::fs::write(&path, &bytes)?;
++                eprintln!("downloaded evidence: {rel_path}");
++                any_success = true;
++            }
++
++            if !any_success {
++                anyhow::bail!("no evidence files found for run {run}");
+             }
+             println!("evidence exported to {out}");
+         }

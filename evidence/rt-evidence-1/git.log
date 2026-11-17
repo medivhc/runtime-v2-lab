@@ -1,0 +1,19 @@
+commit 107e70b9d5ba0c39109c64188065d7bcc42bc10d
+Author: Runtime Builder <runtime-builder@local>
+Date:   Tue Nov 17 22:48:31 2026 +0800
+
+    docs: add DELIVERY-RT-EVIDENCE-1 with commit hash
+
+commit 7873055397d2f2258cc3c6871702456805fb7f7d
+Author: Runtime Builder <runtime-builder@local>
+Date:   Tue Nov 17 22:48:15 2026 +0800
+
+    fix: evidence CLI list & download path encoding (RT-EVIDENCE-1)
+    
+    - CLI no longer depends on non-existent GET /v1/runs/:id endpoint
+    - Downloads known evidence files (patch.diff, git.log) directly by rel_path
+    - URL-encodes rel_path as single segment (%2F for /) via urlencoding crate
+    - Returns non-zero exit on 404 (no evidence found), 409 (hash mismatch), other errors
+    - Fixes silent empty export bug
+    - Fixes central.toml config format to match CentralConfig schema
+    - All 77 tests pass, cargo fmt/clippy clean

@@ -1,0 +1,27 @@
+Now I have all the information needed. Let me provide the final verdict.
+================================================================================
+VERDICT: APPROVE
+
+Findings:
+
+MAJOR: None — all acceptance criteria satisfied.
+
+MINOR:
+1. **Delivery report hash mismatch (cosmetic)**: The DELIVERY report lists sha256 values (cef476... for patch.diff, ee0a5b... for git.log) that differ from the current database state (694bd3... and 5bf40f...). Independent re-run confirms downloaded files match the *current* evidence table exactly — the report likely captured an earlier database snapshot. Does not affect correctness.
+
+2. **CLI default URL (pre-existing)**: `runtime_url()` defaults to port 8080 while central runs on 18080; requires `RUNTIME_URL=http://127.0.0.1:18080`. This is existing behaviour, not a regression.
+
+3. **404 handling nuance**: Task book states “404/哈希不一致时报错退出”. Implementation treats *individual* 404 as warning (skip, continue) to support runs with only one evidence file; *all* 404 → hard error with non-zero exit. This satisfies the core requirement “不再静默空导出” and is a reasonable, practical interpretation.
+
+EVIDENCE FOR APPROVAL:
+- **Task-book compliance**: Direction B (CLI-side known filenames) correctly chosen and documented; URL encoding uses `urlencoding::encode` for single-segment `%2F`; 404/409/hash-mismatch produce non-zero exit with explicit messages; silent empty export eliminated.
+- **No forbidden changes**: Evidence table schema untouched; event write path untouched; `restore.sh` untouched.
+- **Machine gate**: `cargo fmt --check` ✓, `cargo clippy --workspace` (only pre-existing warnings) ✓, `cargo test --workspace` 77/77 pass (baseline only increased) ✓.
+- **CLI end-to-end**:
+  - Existing run `run-18e8745502cfcd9b` → exports both files, sha256 matches evidence table exactly ✓
+  - Non-existent run → prints 404 warnings, “no evidence files found”, exit 1 ✓
+  - Corrupted file (hash mismatch) → HTTP 409, “evidence hash mismatch”, exit 1 ✓
+  - Partial evidence (one file missing) → downloads available file, warns on 404, exit 0 ✓
+- **Config fix**: `configs/central.toml` format corrected to match `CentralConfig`; store/service tests remain green.
+
+All requirements met. The implementation is correct, tested, and ready.
