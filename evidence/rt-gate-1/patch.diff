@@ -1,0 +1,675 @@
+diff --git a/docs/gate.md b/docs/gate.md
+new file mode 100644
+index 0000000..8c9b2b2
+--- /dev/null
++++ b/docs/gate.md
+@@ -0,0 +1,194 @@
++# 客观门禁脚本
++
++本文档说明 `scripts/gate.sh` 的用法、产物契约格式、失败策略枚举及其与本仓库流水线约定的对应关系。
++
++---
++
++## 概述
++
++`gate.sh` 是本仓库的"机器门"实现，将口头约定转化为可执行、可复现的门禁检查。它在仓库根目录运行，执行两类检查：
++
++1. **产物契约校验**（必选）：解析任务书中的「## 产物契约」区块，校验所有必需产物存在且非空。
++2. **三段检查**（可选，默认开启）：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`。
++
++任一检查失败即判定 `GATE: FAIL`，退出码 1；全部通过则 `GATE: PASS`，退出码 0。
++
++---
++
++## 用法
++
++```bash
++# 完整门禁（产物契约 + 三段检查）
++scripts/gate.sh --task <任务书路径>
++
++# 仅产物契约校验（自测、CI 预检查等场景）
++scripts/gate.sh --task <任务书路径> --contract-only
++
++# 显示帮助
++scripts/gate.sh -h
++scripts/gate.sh --help
++```
++
++**参数：**
++
++| 参数 | 必需 | 说明 |
++|------|------|------|
++| `--task <path>` | 是 | 任务书 Markdown 文件路径（相对或绝对） |
++| `--contract-only` | 否 | 仅做产物契约校验，跳过 fmt/clippy/test |
++| `-h, --help` | 否 | 显示帮助信息并退出 |
++
++**输出格式：**
++
++```
++PASS: artifacts/file1.txt
++PASS: artifacts/file2.md
++PASS: fmt
++PASS: clippy
++PASS: test
++GATE: PASS
++```
++
++或失败时：
++
++```
++PASS: artifacts/file1.txt
++FAIL: artifacts/file2.md (存在但为空)
++FAIL: clippy
++GATE: FAIL
++```
++
++**退出码：**
++
++- `0` — GATE PASS
++- `1` — GATE FAIL
++- `2` — 参数错误
++
++---
++
++## 产物契约格式
++
++任务书中必须包含以下结构的 Markdown 区块：
++
++```markdown
++## 产物契约
++- 必需产物：
++  - path/to/artifact1
++  - path/to/artifact2
++  - path/glob/*.rs
++```
++
++**解析规则：**
++
++1. 识别 `## 产物契约` 二级标题（前缀 `##` 后跟空格）。
++2. 在该区块内寻找 `- 必需产物：` 或 `- 必需产物:` 列表项（冒号中英文均可）。
++3. 之后连续的 `- ` 缩进列表项视为必需产物路径。
++4. 每项为相对路径（相对仓库根目录），支持 shell glob 模式（`*`、`?`、`[...]` 等）。
++5. 遇到非 `- ` 开头的行或下一个 `##` 标题，结束解析。
++6. 行内 `#` 后内容视为注释被忽略。
++
++**校验规则：**
++
++- 精确路径：文件必须存在且大小 > 0 字节。
++- glob 模式：必须至少展开到一个文件，且**所有**展开文件均需大小 > 0 字节。
++- 缺失、为空、glob 未命中均记为 `FAIL`。
++
++---
++
++## 失败策略枚举
++
++本仓库流水线约定以下失败策略字段，`gate.sh` 当前实现对应 **机制一（仓库侧机器门）** 的行为：
++
++| 字段 | 取值 | 含义 |
++|------|------|------|
++| `on_failure` | `loop` | 原地重试，上限 3 次，超限转人工 |
++| | `reject` | 直接拒绝，不重试，标记任务失败 |
++| | `fail` | 记录失败但继续流程（软性门禁） |
++| | `human` | 转人工裁决，阻塞等待 |
++| `retry_strategy` | `targeted_fix` | 打回原会话仅改 findings 涉及处 |
++| | `full_redo` | 完整重做整个任务 |
++
++**当前约定（任务书 RT-GATE-1 指定）：**
++
++```yaml
++retry_strategy: targeted_fix
++on_failure: loop
++```
++
++**三轮上限兜底：**
++
++- `on_failure: loop` 配合 `retry_strategy: targeted_fix` 时，最多允许 **3 次** 原地重试。
++- 第 4 次仍失败 → 自动升级为 `human`（人工介入），不再自动重试。
++- 此计数在任务级别维护，由上层编排器（而非 `gate.sh` 本身）负责跟踪与执行。
++
++---
++
++## 与流水线约定的对应关系
++
++| 流水线阶段 | 对应检查 | 失败策略 |
++|------------|----------|----------|
++| **提交前自测** | `gate.sh --contract-only` | 开发者自行修复 |
++| **CI 机器门** | `gate.sh --task <task.md>`（全检查） | `on_failure: loop` + `retry_strategy: targeted_fix`，上限 3 轮 |
++| **人工复核前** | `gate.sh --task <task.md>`（全检查） | 必须 `GATE: PASS` 才能进入人工复核 |
++
++**注意：**
++
++- `gate.sh` 本身**不实现重试逻辑**，只负责单次检查并返回结构化结果（逐项 PASS/FAIL + 最终 GATE 结果 + 退出码）。
++- 重试、计数、升级人工由上层编排器（如 `runtime` 服务、CI workflow）根据 `on_failure` / `retry_strategy` 字段执行。
++- 任务书中的「## 失败与重试策略」区块为声明式配置，供编排器读取；`gate.sh` 仅解析产物契约区块。
++
++---
++
++## 示例任务书片段
++
++```markdown
++# 任务书 RT-EXAMPLE-1
++
++## 失败与重试策略
++- retry_strategy: targeted_fix
++- on_failure: loop
++
++## 产物契约
++- 必需产物：
++  - scripts/new-script.sh
++  - docs/design.md
++  - crates/**/tests/*.rs
++  - evidence/run-*.json
++```
++
++---
++
++## 自测脚本
++
++`scripts/gate-selftest.sh` 验证 `gate.sh --contract-only` 在以下场景的行为：
++
++1. **契约全满足** — 所有产物存在且非空 → `GATE: PASS`
++2. **缺产物** — 列表中某文件不存在 → `GATE: FAIL`
++3. **空产物** — 文件存在但大小为 0 → `GATE: FAIL`
++4. **glob 未命中** — 模式不匹配任何文件 → `GATE: FAIL`
++5. **glob 匹配含空文件** — 至少一个展开文件为空 → `GATE: FAIL`
++
++运行方式：
++
++```bash
++scripts/gate-selftest.sh
++```
++
++输出 `SELFTEST: PASS` 且退出码 0 表示自测通过。
++
++---
++
++## 实现细节
++
++- **Shebang**：`#!/usr/bin/env bash`
++- **严格模式**：`set -euo pipefail`
++- **幂等性**：可重复执行，无副作用
++- **依赖**：标准 bash、coreutils（`grep`、`sed`、`find` 等）、Cargo
++- **路径解析**：相对仓库根目录（脚本所在目录的父目录）
++
++---
++
++## 变更记录
++
++| 版本 | 日期 | 变更 |
++|------|------|------|
++| v1 | 2026-11-18 | 初始版本（RT-GATE-1 交付） |
+\ No newline at end of file
+diff --git a/scripts/gate-selftest.sh b/scripts/gate-selftest.sh
+new file mode 100755
+index 0000000..a14b200
+--- /dev/null
++++ b/scripts/gate-selftest.sh
+@@ -0,0 +1,223 @@
++#!/usr/bin/env bash
++# gate-selftest.sh — gate.sh 自测脚本
++# 用临时目录构造任务书与产物夹具，只调 gate.sh --contract-only 验证退出码与输出
++# 场景：契约全满足、缺产物、空产物、glob 未命中
++# 最后输出 SELFTEST: PASS/FAIL
++set -eu
++
++GATE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/gate.sh"
++REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++TEST_ROOT="$REPO_ROOT/.gate-selftest-$(date +%s)-$$"
++SELFTEST_PASS=true
++
++cleanup() {
++  rm -rf "$TEST_ROOT"
++}
++trap cleanup EXIT
++
++mkdir -p "$TEST_ROOT"
++
++# Helper: get relative path from repo root
++relpath() {
++  local path="$1"
++  echo "${path#$REPO_ROOT/}"
++}
++
++assert_exit_code() {
++  local expected="$1"
++  local actual="$2"
++  local desc="$3"
++  if [[ "$expected" -ne "$actual" ]]; then
++    echo "  ASSERT FAIL: $desc (expected exit $expected, got $actual)"
++    SELFTEST_PASS=false
++  else
++    echo "  ASSERT PASS: $desc (exit $actual)"
++  fi
++}
++
++assert_output_contains() {
++  local output="$1"
++  local pattern="$2"
++  local desc="$3"
++  if echo "$output" | grep -qF "$pattern"; then
++    echo "  ASSERT PASS: $desc (output contains '$pattern')"
++  else
++    echo "  ASSERT FAIL: $desc (output missing '$pattern')"
++    SELFTEST_PASS=false
++  fi
++}
++
++# 场景 1：契约全满足
++echo "=== 场景 1：契约全满足 ==="
++SCENARIO1="$TEST_ROOT/scenario1"
++mkdir -p "$SCENARIO1/artifacts"
++echo "content" > "$SCENARIO1/artifacts/file1.txt"
++echo "content" > "$SCENARIO1/artifacts/file2.md"
++ART1="$(relpath "$SCENARIO1/artifacts/file1.txt")"
++ART2="$(relpath "$SCENARIO1/artifacts/file2.md")"
++cat > "$SCENARIO1/task.md" <<EOF
++# 任务书
++
++## 产物契约
++- 必需产物：
++  - $ART1
++  - $ART2
++EOF
++
++# Run gate.sh and capture both output and exit code
++run_gate_capture() {
++  local task_file="$1"
++  local output
++  local rc
++  output=$(bash "$GATE_SCRIPT" --task "$task_file" --contract-only 2>&1)
++  rc=$?
++  echo "$output"
++  return $rc
++}
++
++set +e
++run_gate_capture "$SCENARIO1/task.md"
++exit_code=$?
++set -e
++set +e
++output=$(bash "$GATE_SCRIPT" --task "$SCENARIO1/task.md" --contract-only 2>&1)
++set -e
++echo "$output"
++assert_exit_code 0 $exit_code "场景1 退出码应为 0"
++assert_output_contains "$output" "PASS: $ART1" "场景1 file1.txt PASS"
++assert_output_contains "$output" "PASS: $ART2" "场景1 file2.md PASS"
++assert_output_contains "$output" "GATE: PASS" "场景1 GATE PASS"
++
++# 场景 2：缺产物
++echo ""
++echo "=== 场景 2：缺产物 ==="
++SCENARIO2="$TEST_ROOT/scenario2"
++mkdir -p "$SCENARIO2/artifacts"
++echo "content" > "$SCENARIO2/artifacts/file1.txt"
++# file2.md 故意不创建
++ART1="$(relpath "$SCENARIO2/artifacts/file1.txt")"
++ART2="$(relpath "$SCENARIO2/artifacts/file2.md")"
++cat > "$SCENARIO2/task.md" <<EOF
++# 任务书
++
++## 产物契约
++- 必需产物：
++  - $ART1
++  - $ART2
++EOF
++
++set +e
++run_gate_capture "$SCENARIO2/task.md"
++exit_code=$?
++set -e
++set +e
++output=$(bash "$GATE_SCRIPT" --task "$SCENARIO2/task.md" --contract-only 2>&1)
++set -e
++echo "$output"
++assert_exit_code 1 $exit_code "场景2 退出码应为 1"
++assert_output_contains "$output" "PASS: $ART1" "场景2 file1.txt PASS"
++assert_output_contains "$output" "FAIL: $ART2" "场景2 file2.md FAIL"
++assert_output_contains "$output" "GATE: FAIL" "场景2 GATE FAIL"
++
++# 场景 3：空产物
++echo ""
++echo "=== 场景 3：空产物 ==="
++SCENARIO3="$TEST_ROOT/scenario3"
++mkdir -p "$SCENARIO3/artifacts"
++echo "content" > "$SCENARIO3/artifacts/file1.txt"
++touch "$SCENARIO3/artifacts/empty.txt"  # 空文件
++ART1="$(relpath "$SCENARIO3/artifacts/file1.txt")"
++ART2="$(relpath "$SCENARIO3/artifacts/empty.txt")"
++cat > "$SCENARIO3/task.md" <<EOF
++# 任务书
++
++## 产物契约
++- 必需产物：
++  - $ART1
++  - $ART2
++EOF
++
++set +e
++run_gate_capture "$SCENARIO3/task.md"
++exit_code=$?
++set -e
++set +e
++output=$(bash "$GATE_SCRIPT" --task "$SCENARIO3/task.md" --contract-only 2>&1)
++set -e
++echo "$output"
++assert_exit_code 1 $exit_code "场景3 退出码应为 1"
++assert_output_contains "$output" "PASS: $ART1" "场景3 file1.txt PASS"
++assert_output_contains "$output" "FAIL: $ART2" "场景3 empty.txt FAIL"
++assert_output_contains "$output" "GATE: FAIL" "场景3 GATE FAIL"
++
++# 场景 4：glob 未命中
++echo ""
++echo "=== 场景 4：glob 未命中 ==="
++SCENARIO4="$TEST_ROOT/scenario4"
++mkdir -p "$SCENARIO4/artifacts"
++echo "content" > "$SCENARIO4/artifacts/file1.txt"
++# 故意没有 *.log 文件
++ART1="$(relpath "$SCENARIO4/artifacts/file1.txt")"
++ART_GLOB="$(relpath "$SCENARIO4/artifacts/*.log")"
++cat > "$SCENARIO4/task.md" <<EOF
++# 任务书
++
++## 产物契约
++- 必需产物：
++  - $ART1
++  - $ART_GLOB
++EOF
++
++set +e
++run_gate_capture "$SCENARIO4/task.md"
++exit_code=$?
++set -e
++set +e
++output=$(bash "$GATE_SCRIPT" --task "$SCENARIO4/task.md" --contract-only 2>&1)
++set -e
++echo "$output"
++assert_exit_code 1 $exit_code "场景4 退出码应为 1"
++assert_output_contains "$output" "PASS: $ART1" "场景4 file1.txt PASS"
++assert_output_contains "$output" "FAIL: $ART_GLOB" "场景4 *.log FAIL"
++assert_output_contains "$output" "GATE: FAIL" "场景4 GATE FAIL"
++
++# 额外场景：glob 匹配多个文件，其中有空文件
++echo ""
++echo "=== 场景 5：glob 匹配多文件含空文件 ==="
++SCENARIO5="$TEST_ROOT/scenario5"
++mkdir -p "$SCENARIO5/artifacts"
++echo "content" > "$SCENARIO5/artifacts/a.log"
++touch "$SCENARIO5/artifacts/b.log"  # 空文件
++ART_GLOB="$(relpath "$SCENARIO5/artifacts/*.log")"
++cat > "$SCENARIO5/task.md" <<EOF
++# 任务书
++
++## 产物契约
++- 必需产物：
++  - $ART_GLOB
++EOF
++
++set +e
++run_gate_capture "$SCENARIO5/task.md"
++exit_code=$?
++set -e
++set +e
++output=$(bash "$GATE_SCRIPT" --task "$SCENARIO5/task.md" --contract-only 2>&1)
++set -e
++echo "$output"
++assert_exit_code 1 $exit_code "场景5 退出码应为 1"
++# glob 展开后会显示具体的空文件名，而非 glob 模式
++assert_output_contains "$output" "FAIL: " "场景5 有 FAIL 输出"
++assert_output_contains "$output" "b.log" "场景5 空文件 b.log 被检出"
++assert_output_contains "$output" "GATE: FAIL" "场景5 GATE FAIL"
++
++# 最终结果
++echo ""
++echo "=== 自测汇总 ==="
++if [[ "$SELFTEST_PASS" == true ]]; then
++  echo "SELFTEST: PASS"
++  exit 0
++else
++  echo "SELFTEST: FAIL"
++  exit 1
++fi
+\ No newline at end of file
+diff --git a/scripts/gate.sh b/scripts/gate.sh
+new file mode 100755
+index 0000000..febfbe4
+--- /dev/null
++++ b/scripts/gate.sh
+@@ -0,0 +1,237 @@
++#!/usr/bin/env bash
++# gate.sh — 客观门禁脚本（机制一落地·仓库侧）
++# 用法：gate.sh --task <任务书路径> [--contract-only]
++#   在仓库根目录运行。解析任务书中的产物契约并校验；非 --contract-only 时再跑三段检查。
++# 退出码：0=GATE PASS，1=GATE FAIL
++set -euo pipefail
++
++usage() {
++  cat <<'EOF'
++用法: gate.sh --task <任务书路径> [--contract-only]
++
++参数:
++  --task <path>       任务书 Markdown 文件路径（必需）
++  --contract-only     仅做产物契约校验，跳过 fmt/clippy/test 三段检查
++  -h, --help          显示此帮助
++
++行为:
++  1) 产物契约校验：解析任务书中「## 产物契约」区块下「- 必需产物：」之后的
++     每个 "- " 列表项（相对路径，支持 glob）；逐项校验存在且非空
++     (glob 须至少展开到一个非空文件)。缺失或空 → 记 FAIL。
++  2) 三段检查（非 --contract-only 时）：
++     cargo fmt --check
++     cargo clippy --all-targets -- -D warnings
++     cargo test --workspace
++     任一失败 → 记 FAIL。
++  3) 输出：逐项 "PASS/FAIL: <检查项>"，最后一行 "GATE: PASS" 或 "GATE: FAIL"。
++
++退出码: 0=PASS, 1=FAIL
++EOF
++}
++
++# 参数解析
++TASK_FILE=""
++CONTRACT_ONLY=false
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    --task)
++      TASK_FILE="${2:-}"
++      shift 2
++      ;;
++    --contract-only)
++      CONTRACT_ONLY=true
++      shift
++      ;;
++    -h|--help)
++      usage
++      exit 0
++      ;;
++    *)
++      echo "未知参数: $1" >&2
++      usage
++      exit 2
++      ;;
++  esac
++done
++
++if [[ -z "$TASK_FILE" ]]; then
++  echo "错误: 必需参数 --task <任务书路径>" >&2
++  usage
++  exit 2
++fi
++
++# 解析任务书绝对路径（在 cd 之前）
++TASK_FILE_ABS="$(cd "$(dirname "$TASK_FILE")" && pwd)/$(basename "$TASK_FILE")"
++if [[ ! -f "$TASK_FILE_ABS" ]]; then
++  echo "错误: 任务书不存在: $TASK_FILE" >&2
++  exit 1
++fi
++
++# 确保在仓库根目录
++REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++cd "$REPO_ROOT"
++
++# 解析任务书中的产物契约
++parse_artifacts() {
++  local task_file="$1"
++  local in_contract=false
++  local in_required=false
++
++  while IFS= read -r line; do
++    # 检测 "## 产物契约" 区块开始
++    if [[ "$line" =~ ^##[[:space:]]+产物契约 ]]; then
++      in_contract=true
++      continue
++    fi
++
++    # 离开二级标题区块
++    if [[ "$in_contract" == true && "$line" =~ ^##[[:space:]]+ ]]; then
++      break
++    fi
++
++    # 检测 "- 必需产物："
++    if [[ "$in_contract" == true && "$line" =~ ^-[[:space:]]+必需产物[：:] ]]; then
++      in_required=true
++      continue
++    fi
++
++    # 解析列表项 "- 路径"
++    if [[ "$in_required" == true && "$line" =~ ^[[:space:]]*-[[:space:]]+(.+) ]]; then
++      local item="${BASH_REMATCH[1]}"
++      # 去除行内注释
++      item="${item%%#*}"
++      # 去除首尾空白
++      item="$(echo "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
++      if [[ -n "$item" ]]; then
++        echo "$item"
++      fi
++      continue
++    fi
++
++    # 遇到非列表项且已在必需产物区，结束
++    if [[ "$in_required" == true && ! "$line" =~ ^[[:space:]]*- ]]; then
++      break
++    fi
++  done < "$task_file"
++}
++
++# 校验单个产物路径（支持 glob）
++check_artifact() {
++  local pattern="$1"
++  local all_nonempty=true
++
++  # 判断是否包含 glob 元字符
++  if [[ "$pattern" == *[\[\*\?]* ]]; then
++    # glob 模式：使用 nullglob 展开
++    local saved_nullglob
++    saved_nullglob=$(shopt -p nullglob 2>/dev/null || echo "unset")
++    shopt -s nullglob
++
++    local matches=()
++    for f in $pattern; do
++      matches+=("$f")
++    done
++
++    # 恢复 nullglob 状态
++    if [[ "$saved_nullglob" == "unset" ]]; then
++      shopt -u nullglob
++    else
++      eval "$saved_nullglob"
++    fi
++
++    if [[ ${#matches[@]} -eq 0 ]]; then
++      echo "FAIL: $pattern (glob 未命中任何文件)"
++      return 1
++    fi
++
++    for f in "${matches[@]}"; do
++      if [[ ! -s "$f" ]]; then
++        echo "FAIL: $f (存在但为空)"
++        all_nonempty=false
++      fi
++    done
++  else
++    # 字面路径：直接检查文件是否存在且非空
++    if [[ ! -e "$pattern" ]]; then
++      echo "FAIL: $pattern (文件不存在)"
++      return 1
++    fi
++    if [[ ! -s "$pattern" ]]; then
++      echo "FAIL: $pattern (存在但为空)"
++      return 1
++    fi
++  fi
++
++  if [[ "$all_nonempty" == true ]]; then
++    echo "PASS: $pattern"
++    return 0
++  else
++    return 1
++  fi
++}
++
++# 执行三段检查
++run_checks() {
++  local checks=(
++    "cargo fmt --check:fmt"
++    "cargo clippy --all-targets -- -D warnings:clippy"
++    "cargo test --workspace:test"
++  )
++
++  local all_pass=true
++  for check in "${checks[@]}"; do
++    local cmd="${check%%:*}"
++    local name="${check##*:}"
++    if eval "$cmd" >/dev/null 2>&1; then
++      echo "PASS: $name"
++    else
++      echo "FAIL: $name"
++      all_pass=false
++    fi
++  done
++
++  if [[ "$all_pass" == true ]]; then
++    return 0
++  else
++    return 1
++  fi
++}
++
++# 主流程
++main() {
++  local artifacts
++  mapfile -t artifacts < <(parse_artifacts "$TASK_FILE_ABS")
++
++  if [[ ${#artifacts[@]} -eq 0 ]]; then
++    echo "FAIL: 任务书中未找到产物契约（## 产物契约 -> - 必需产物：列表）" >&2
++    exit 1
++  fi
++
++  local overall_pass=true
++
++  # 1. 产物契约校验
++  for artifact in "${artifacts[@]}"; do
++    if ! check_artifact "$artifact"; then
++      overall_pass=false
++    fi
++  done
++
++  # 2. 三段检查
++  if [[ "$CONTRACT_ONLY" == false ]]; then
++    if ! run_checks; then
++      overall_pass=false
++    fi
++  fi
++
++  # 最终结果
++  if [[ "$overall_pass" == true ]]; then
++    echo "GATE: PASS"
++    exit 0
++  else
++    echo "GATE: FAIL"
++    exit 1
++  fi
++}
++
++main "$@"
+\ No newline at end of file

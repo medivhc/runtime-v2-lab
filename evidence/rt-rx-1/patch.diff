@@ -1,0 +1,1512 @@
+diff --git a/docs/gate.md b/docs/gate.md
+deleted file mode 100644
+index 8c9b2b2..0000000
+--- a/docs/gate.md
++++ /dev/null
+@@ -1,194 +0,0 @@
+-# 客观门禁脚本
+-
+-本文档说明 `scripts/gate.sh` 的用法、产物契约格式、失败策略枚举及其与本仓库流水线约定的对应关系。
+-
+----
+-
+-## 概述
+-
+-`gate.sh` 是本仓库的"机器门"实现，将口头约定转化为可执行、可复现的门禁检查。它在仓库根目录运行，执行两类检查：
+-
+-1. **产物契约校验**（必选）：解析任务书中的「## 产物契约」区块，校验所有必需产物存在且非空。
+-2. **三段检查**（可选，默认开启）：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`。
+-
+-任一检查失败即判定 `GATE: FAIL`，退出码 1；全部通过则 `GATE: PASS`，退出码 0。
+-
+----
+-
+-## 用法
+-
+-```bash
+-# 完整门禁（产物契约 + 三段检查）
+-scripts/gate.sh --task <任务书路径>
+-
+-# 仅产物契约校验（自测、CI 预检查等场景）
+-scripts/gate.sh --task <任务书路径> --contract-only
+-
+-# 显示帮助
+-scripts/gate.sh -h
+-scripts/gate.sh --help
+-```
+-
+-**参数：**
+-
+-| 参数 | 必需 | 说明 |
+-|------|------|------|
+-| `--task <path>` | 是 | 任务书 Markdown 文件路径（相对或绝对） |
+-| `--contract-only` | 否 | 仅做产物契约校验，跳过 fmt/clippy/test |
+-| `-h, --help` | 否 | 显示帮助信息并退出 |
+-
+-**输出格式：**
+-
+-```
+-PASS: artifacts/file1.txt
+-PASS: artifacts/file2.md
+-PASS: fmt
+-PASS: clippy
+-PASS: test
+-GATE: PASS
+-```
+-
+-或失败时：
+-
+-```
+-PASS: artifacts/file1.txt
+-FAIL: artifacts/file2.md (存在但为空)
+-FAIL: clippy
+-GATE: FAIL
+-```
+-
+-**退出码：**
+-
+-- `0` — GATE PASS
+-- `1` — GATE FAIL
+-- `2` — 参数错误
+-
+----
+-
+-## 产物契约格式
+-
+-任务书中必须包含以下结构的 Markdown 区块：
+-
+-```markdown
+-## 产物契约
+-- 必需产物：
+-  - path/to/artifact1
+-  - path/to/artifact2
+-  - path/glob/*.rs
+-```
+-
+-**解析规则：**
+-
+-1. 识别 `## 产物契约` 二级标题（前缀 `##` 后跟空格）。
+-2. 在该区块内寻找 `- 必需产物：` 或 `- 必需产物:` 列表项（冒号中英文均可）。
+-3. 之后连续的 `- ` 缩进列表项视为必需产物路径。
+-4. 每项为相对路径（相对仓库根目录），支持 shell glob 模式（`*`、`?`、`[...]` 等）。
+-5. 遇到非 `- ` 开头的行或下一个 `##` 标题，结束解析。
+-6. 行内 `#` 后内容视为注释被忽略。
+-
+-**校验规则：**
+-
+-- 精确路径：文件必须存在且大小 > 0 字节。
+-- glob 模式：必须至少展开到一个文件，且**所有**展开文件均需大小 > 0 字节。
+-- 缺失、为空、glob 未命中均记为 `FAIL`。
+-
+----
+-
+-## 失败策略枚举
+-
+-本仓库流水线约定以下失败策略字段，`gate.sh` 当前实现对应 **机制一（仓库侧机器门）** 的行为：
+-
+-| 字段 | 取值 | 含义 |
+-|------|------|------|
+-| `on_failure` | `loop` | 原地重试，上限 3 次，超限转人工 |
+-| | `reject` | 直接拒绝，不重试，标记任务失败 |
+-| | `fail` | 记录失败但继续流程（软性门禁） |
+-| | `human` | 转人工裁决，阻塞等待 |
+-| `retry_strategy` | `targeted_fix` | 打回原会话仅改 findings 涉及处 |
+-| | `full_redo` | 完整重做整个任务 |
+-
+-**当前约定（任务书 RT-GATE-1 指定）：**
+-
+-```yaml
+-retry_strategy: targeted_fix
+-on_failure: loop
+-```
+-
+-**三轮上限兜底：**
+-
+-- `on_failure: loop` 配合 `retry_strategy: targeted_fix` 时，最多允许 **3 次** 原地重试。
+-- 第 4 次仍失败 → 自动升级为 `human`（人工介入），不再自动重试。
+-- 此计数在任务级别维护，由上层编排器（而非 `gate.sh` 本身）负责跟踪与执行。
+-
+----
+-
+-## 与流水线约定的对应关系
+-
+-| 流水线阶段 | 对应检查 | 失败策略 |
+-|------------|----------|----------|
+-| **提交前自测** | `gate.sh --contract-only` | 开发者自行修复 |
+-| **CI 机器门** | `gate.sh --task <task.md>`（全检查） | `on_failure: loop` + `retry_strategy: targeted_fix`，上限 3 轮 |
+-| **人工复核前** | `gate.sh --task <task.md>`（全检查） | 必须 `GATE: PASS` 才能进入人工复核 |
+-
+-**注意：**
+-
+-- `gate.sh` 本身**不实现重试逻辑**，只负责单次检查并返回结构化结果（逐项 PASS/FAIL + 最终 GATE 结果 + 退出码）。
+-- 重试、计数、升级人工由上层编排器（如 `runtime` 服务、CI workflow）根据 `on_failure` / `retry_strategy` 字段执行。
+-- 任务书中的「## 失败与重试策略」区块为声明式配置，供编排器读取；`gate.sh` 仅解析产物契约区块。
+-
+----
+-
+-## 示例任务书片段
+-
+-```markdown
+-# 任务书 RT-EXAMPLE-1
+-
+-## 失败与重试策略
+-- retry_strategy: targeted_fix
+-- on_failure: loop
+-
+-## 产物契约
+-- 必需产物：
+-  - scripts/new-script.sh
+-  - docs/design.md
+-  - crates/**/tests/*.rs
+-  - evidence/run-*.json
+-```
+-
+----
+-
+-## 自测脚本
+-
+-`scripts/gate-selftest.sh` 验证 `gate.sh --contract-only` 在以下场景的行为：
+-
+-1. **契约全满足** — 所有产物存在且非空 → `GATE: PASS`
+-2. **缺产物** — 列表中某文件不存在 → `GATE: FAIL`
+-3. **空产物** — 文件存在但大小为 0 → `GATE: FAIL`
+-4. **glob 未命中** — 模式不匹配任何文件 → `GATE: FAIL`
+-5. **glob 匹配含空文件** — 至少一个展开文件为空 → `GATE: FAIL`
+-
+-运行方式：
+-
+-```bash
+-scripts/gate-selftest.sh
+-```
+-
+-输出 `SELFTEST: PASS` 且退出码 0 表示自测通过。
+-
+----
+-
+-## 实现细节
+-
+-- **Shebang**：`#!/usr/bin/env bash`
+-- **严格模式**：`set -euo pipefail`
+-- **幂等性**：可重复执行，无副作用
+-- **依赖**：标准 bash、coreutils（`grep`、`sed`、`find` 等）、Cargo
+-- **路径解析**：相对仓库根目录（脚本所在目录的父目录）
+-
+----
+-
+-## 变更记录
+-
+-| 版本 | 日期 | 变更 |
+-|------|------|------|
+-| v1 | 2026-11-18 | 初始版本（RT-GATE-1 交付） |
+\ No newline at end of file
+diff --git a/docs/rx.md b/docs/rx.md
+new file mode 100644
+index 0000000..10f9da3
+--- /dev/null
++++ b/docs/rx.md
+@@ -0,0 +1,123 @@
++# 处方草稿机制
++
++## 定位与设计理念
++
++本机制借鉴 **LoopForge runeval 三段式** 思想，将归档环节的"事后改进"拆解为三个受控阶段：
++
++```
++事实提取 → 受控处方 → 人工应用
++    ↓           ↓           ↓
++review/DELIVERY  rx-draft.sh  编排方/维护者
++```
++
++- **事实提取**：从审查结论的 `FINDINGS` 与 `DELIVERY` 返工记录中自动归纳问题
++- **受控处方**：`scripts/rx-draft.sh` 仅输出**草稿**，动作严格限定在枚举集合内，禁止自由文本
++- **人工应用**：确认后由编排方将处方写入任务书模板、机器门配置或审查提示词，**脚本永不写入任何流程文件**
++
++## 为何不自动应用？
++
++1. **可审计**：每条处方有明确溯源，人工确认留存决策痕迹
++2. **可逆转**：草稿阶段可丢弃、合并、拆分，不污染流程基线
++3. **最小权限**：脚本只读归档产物，不持有写入流程文件的权限
++
++## 脚本规格
++
++### `scripts/rx-draft.sh`
++
++**用法**
++```bash
++rx-draft.sh --task <任务书路径> --evidence <evidence目录> --out <输出路径>
++```
++
++**输入**
++- 任务书全文
++- `evidence/` 目录下的：
++  - `review-*-verdict.txt`：含 `FINDINGS` 区块，每行以 `CRITICAL:`/`MAJOR:`/`MINOR:` 开头
++  - `DELIVERY*.md`：含返工/遗留记录（关键字：返工、遗留、remaining、rework、follow-up、后续、未解决、待解决）
++
++**输出**：`rx-draft.md`
++
++**处方动作枚举**（三选一，禁止其他动作）
++
++| 动作 | 语义 | 典型触发场景 |
++|------|------|-------------|
++| `update_task_template` | 修改任务书模板 | 任务书结构缺失、验收档定义模糊、配置格式规范需更新 |
++| `add_gate_check` | 新增机器门检查项 | 缺失自动化校验（哈希一致性、fmt/clippy/test、格式校验等） |
++| `append_review_prompt` | 追加审查提示词 | 审查关注点遗漏、需增加人工评审检查清单项 |
++
++**输出格式**
++```markdown
++# 处方草稿
++
++> 处方草稿，须人工确认后应用，脚本不自动修改任何流程文件
++
++- action: add_gate_check
++  rationale: "Hash verification mismatch in DELIVERY report - reported hashes differ from evidence table" (source: evidence/rt-evidence-1/review-verdict.txt:10)
++  status: DRAFT
++
++- action: append_review_prompt
++  rationale: "遗留: Need to add automated hash verification gate check in CI pipeline." (source: evidence/rt-evidence-1/DELIVERY-test.md:8)
++  status: DRAFT
++```
++
++**无 findings 时输出**：
++```markdown
++# 处方草稿
++
++> 处方草稿，须人工确认后应用，脚本不自动修改任何流程文件
++
++无处方建议
++```
++
++### `scripts/rx-selftest.sh`
++
++自测脚本，覆盖三大场景：
++1. **有 findings** → 生成 1–2 条处方，动作合法、带 rationale 与 DRAFT 状态
++2. **无 findings** → 输出"无处方建议"
++3. **非法动作被拒绝** → 任意输入文本均映射到合法枚举，不产生非法 action
++
++运行方式：
++```bash
++./scripts/rx-selftest.sh
++# 输出 SELFTEST: PASS / FAIL
++```
++
++## 人工确认流程
++
++1. **生成草稿**：归档环节执行 `rx-draft.sh`，产出 `rx-draft.md`
++2. **评审草稿**：编排方/维护者阅读 `rationale` 与溯源行号，判断是否采纳
++3. **执行应用**（三选一，对应动作枚举）：
++   - `update_task_template` → 编辑 `docs/tasks/` 下的任务书模板或基线任务书
++   - `add_gate_check` → 修改 CI 配置、验收脚本或 `configs/` 下的机器门规则
++   - `append_review_prompt` → 追加内容至审查提示词文档（如 `docs/review-prompt.md` 或类似）
++4. **记录决策**：在 `rx-draft.md` 旁或归档记录中标注 `status: APPLIED` / `status: REJECTED` 与确认人、日期
++5. **归档**：将确认后的 `rx-draft.md` 纳入证据归档目录
++
++## 约束与边界
++
++- **脚本只读**：`rx-draft.sh` 仅读取归档产物，**绝不写入**任务书、审查提示词、CI 配置等流程文件
++- **幂等性**：同一输入多次运行产出相同草稿
++- **上限 2 条**：每次归档最多产出 2 条处方，避免噪音
++- **枚举封闭**：动作集合固定为三值，新增动作需修改脚本与文档同步变更
++
++## 示例：真实证据产出的处方草稿
++
++基于 `evidence/rt-evidence-1/` 的真实审查结论与 DELIVERY：
++
++```markdown
++# 处方草稿
++
++> 处方草稿，须人工确认后应用，脚本不自动修改任何流程文件
++
++- action: add_gate_check
++  rationale: "Hash verification mismatch in DELIVERY report - reported hashes differ from evidence table" (source: evidence/rt-evidence-1/review-verdict.txt:10)
++  status: DRAFT
++
++- action: update_task_template
++  rationale: "Config format inconsistency in central.toml (pre-existing)" (source: evidence/rt-evidence-1/review-verdict.txt:12)
++  status: DRAFT
++```
++
++---
++
++*本文档随 `scripts/rx-draft.sh`、`scripts/rx-selftest.sh` 同步维护，版本锚定为 rx-v1。*
+\ No newline at end of file
+diff --git a/scripts/gate-selftest.sh b/scripts/gate-selftest.sh
+deleted file mode 100755
+index a14b200..0000000
+--- a/scripts/gate-selftest.sh
++++ /dev/null
+@@ -1,223 +0,0 @@
+-#!/usr/bin/env bash
+-# gate-selftest.sh — gate.sh 自测脚本
+-# 用临时目录构造任务书与产物夹具，只调 gate.sh --contract-only 验证退出码与输出
+-# 场景：契约全满足、缺产物、空产物、glob 未命中
+-# 最后输出 SELFTEST: PASS/FAIL
+-set -eu
+-
+-GATE_SCRIPT="$(cd "$(dirname "$0")" && pwd)/gate.sh"
+-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+-TEST_ROOT="$REPO_ROOT/.gate-selftest-$(date +%s)-$$"
+-SELFTEST_PASS=true
+-
+-cleanup() {
+-  rm -rf "$TEST_ROOT"
+-}
+-trap cleanup EXIT
+-
+-mkdir -p "$TEST_ROOT"
+-
+-# Helper: get relative path from repo root
+-relpath() {
+-  local path="$1"
+-  echo "${path#$REPO_ROOT/}"
+-}
+-
+-assert_exit_code() {
+-  local expected="$1"
+-  local actual="$2"
+-  local desc="$3"
+-  if [[ "$expected" -ne "$actual" ]]; then
+-    echo "  ASSERT FAIL: $desc (expected exit $expected, got $actual)"
+-    SELFTEST_PASS=false
+-  else
+-    echo "  ASSERT PASS: $desc (exit $actual)"
+-  fi
+-}
+-
+-assert_output_contains() {
+-  local output="$1"
+-  local pattern="$2"
+-  local desc="$3"
+-  if echo "$output" | grep -qF "$pattern"; then
+-    echo "  ASSERT PASS: $desc (output contains '$pattern')"
+-  else
+-    echo "  ASSERT FAIL: $desc (output missing '$pattern')"
+-    SELFTEST_PASS=false
+-  fi
+-}
+-
+-# 场景 1：契约全满足
+-echo "=== 场景 1：契约全满足 ==="
+-SCENARIO1="$TEST_ROOT/scenario1"
+-mkdir -p "$SCENARIO1/artifacts"
+-echo "content" > "$SCENARIO1/artifacts/file1.txt"
+-echo "content" > "$SCENARIO1/artifacts/file2.md"
+-ART1="$(relpath "$SCENARIO1/artifacts/file1.txt")"
+-ART2="$(relpath "$SCENARIO1/artifacts/file2.md")"
+-cat > "$SCENARIO1/task.md" <<EOF
+-# 任务书
+-
+-## 产物契约
+-- 必需产物：
+-  - $ART1
+-  - $ART2
+-EOF
+-
+-# Run gate.sh and capture both output and exit code
+-run_gate_capture() {
+-  local task_file="$1"
+-  local output
+-  local rc
+-  output=$(bash "$GATE_SCRIPT" --task "$task_file" --contract-only 2>&1)
+-  rc=$?
+-  echo "$output"
+-  return $rc
+-}
+-
+-set +e
+-run_gate_capture "$SCENARIO1/task.md"
+-exit_code=$?
+-set -e
+-set +e
+-output=$(bash "$GATE_SCRIPT" --task "$SCENARIO1/task.md" --contract-only 2>&1)
+-set -e
+-echo "$output"
+-assert_exit_code 0 $exit_code "场景1 退出码应为 0"
+-assert_output_contains "$output" "PASS: $ART1" "场景1 file1.txt PASS"
+-assert_output_contains "$output" "PASS: $ART2" "场景1 file2.md PASS"
+-assert_output_contains "$output" "GATE: PASS" "场景1 GATE PASS"
+-
+-# 场景 2：缺产物
+-echo ""
+-echo "=== 场景 2：缺产物 ==="
+-SCENARIO2="$TEST_ROOT/scenario2"
+-mkdir -p "$SCENARIO2/artifacts"
+-echo "content" > "$SCENARIO2/artifacts/file1.txt"
+-# file2.md 故意不创建
+-ART1="$(relpath "$SCENARIO2/artifacts/file1.txt")"
+-ART2="$(relpath "$SCENARIO2/artifacts/file2.md")"
+-cat > "$SCENARIO2/task.md" <<EOF
+-# 任务书
+-
+-## 产物契约
+-- 必需产物：
+-  - $ART1
+-  - $ART2
+-EOF
+-
+-set +e
+-run_gate_capture "$SCENARIO2/task.md"
+-exit_code=$?
+-set -e
+-set +e
+-output=$(bash "$GATE_SCRIPT" --task "$SCENARIO2/task.md" --contract-only 2>&1)
+-set -e
+-echo "$output"
+-assert_exit_code 1 $exit_code "场景2 退出码应为 1"
+-assert_output_contains "$output" "PASS: $ART1" "场景2 file1.txt PASS"
+-assert_output_contains "$output" "FAIL: $ART2" "场景2 file2.md FAIL"
+-assert_output_contains "$output" "GATE: FAIL" "场景2 GATE FAIL"
+-
+-# 场景 3：空产物
+-echo ""
+-echo "=== 场景 3：空产物 ==="
+-SCENARIO3="$TEST_ROOT/scenario3"
+-mkdir -p "$SCENARIO3/artifacts"
+-echo "content" > "$SCENARIO3/artifacts/file1.txt"
+-touch "$SCENARIO3/artifacts/empty.txt"  # 空文件
+-ART1="$(relpath "$SCENARIO3/artifacts/file1.txt")"
+-ART2="$(relpath "$SCENARIO3/artifacts/empty.txt")"
+-cat > "$SCENARIO3/task.md" <<EOF
+-# 任务书
+-
+-## 产物契约
+-- 必需产物：
+-  - $ART1
+-  - $ART2
+-EOF
+-
+-set +e
+-run_gate_capture "$SCENARIO3/task.md"
+-exit_code=$?
+-set -e
+-set +e
+-output=$(bash "$GATE_SCRIPT" --task "$SCENARIO3/task.md" --contract-only 2>&1)
+-set -e
+-echo "$output"
+-assert_exit_code 1 $exit_code "场景3 退出码应为 1"
+-assert_output_contains "$output" "PASS: $ART1" "场景3 file1.txt PASS"
+-assert_output_contains "$output" "FAIL: $ART2" "场景3 empty.txt FAIL"
+-assert_output_contains "$output" "GATE: FAIL" "场景3 GATE FAIL"
+-
+-# 场景 4：glob 未命中
+-echo ""
+-echo "=== 场景 4：glob 未命中 ==="
+-SCENARIO4="$TEST_ROOT/scenario4"
+-mkdir -p "$SCENARIO4/artifacts"
+-echo "content" > "$SCENARIO4/artifacts/file1.txt"
+-# 故意没有 *.log 文件
+-ART1="$(relpath "$SCENARIO4/artifacts/file1.txt")"
+-ART_GLOB="$(relpath "$SCENARIO4/artifacts/*.log")"
+-cat > "$SCENARIO4/task.md" <<EOF
+-# 任务书
+-
+-## 产物契约
+-- 必需产物：
+-  - $ART1
+-  - $ART_GLOB
+-EOF
+-
+-set +e
+-run_gate_capture "$SCENARIO4/task.md"
+-exit_code=$?
+-set -e
+-set +e
+-output=$(bash "$GATE_SCRIPT" --task "$SCENARIO4/task.md" --contract-only 2>&1)
+-set -e
+-echo "$output"
+-assert_exit_code 1 $exit_code "场景4 退出码应为 1"
+-assert_output_contains "$output" "PASS: $ART1" "场景4 file1.txt PASS"
+-assert_output_contains "$output" "FAIL: $ART_GLOB" "场景4 *.log FAIL"
+-assert_output_contains "$output" "GATE: FAIL" "场景4 GATE FAIL"
+-
+-# 额外场景：glob 匹配多个文件，其中有空文件
+-echo ""
+-echo "=== 场景 5：glob 匹配多文件含空文件 ==="
+-SCENARIO5="$TEST_ROOT/scenario5"
+-mkdir -p "$SCENARIO5/artifacts"
+-echo "content" > "$SCENARIO5/artifacts/a.log"
+-touch "$SCENARIO5/artifacts/b.log"  # 空文件
+-ART_GLOB="$(relpath "$SCENARIO5/artifacts/*.log")"
+-cat > "$SCENARIO5/task.md" <<EOF
+-# 任务书
+-
+-## 产物契约
+-- 必需产物：
+-  - $ART_GLOB
+-EOF
+-
+-set +e
+-run_gate_capture "$SCENARIO5/task.md"
+-exit_code=$?
+-set -e
+-set +e
+-output=$(bash "$GATE_SCRIPT" --task "$SCENARIO5/task.md" --contract-only 2>&1)
+-set -e
+-echo "$output"
+-assert_exit_code 1 $exit_code "场景5 退出码应为 1"
+-# glob 展开后会显示具体的空文件名，而非 glob 模式
+-assert_output_contains "$output" "FAIL: " "场景5 有 FAIL 输出"
+-assert_output_contains "$output" "b.log" "场景5 空文件 b.log 被检出"
+-assert_output_contains "$output" "GATE: FAIL" "场景5 GATE FAIL"
+-
+-# 最终结果
+-echo ""
+-echo "=== 自测汇总 ==="
+-if [[ "$SELFTEST_PASS" == true ]]; then
+-  echo "SELFTEST: PASS"
+-  exit 0
+-else
+-  echo "SELFTEST: FAIL"
+-  exit 1
+-fi
+\ No newline at end of file
+diff --git a/scripts/gate.sh b/scripts/gate.sh
+deleted file mode 100755
+index febfbe4..0000000
+--- a/scripts/gate.sh
++++ /dev/null
+@@ -1,237 +0,0 @@
+-#!/usr/bin/env bash
+-# gate.sh — 客观门禁脚本（机制一落地·仓库侧）
+-# 用法：gate.sh --task <任务书路径> [--contract-only]
+-#   在仓库根目录运行。解析任务书中的产物契约并校验；非 --contract-only 时再跑三段检查。
+-# 退出码：0=GATE PASS，1=GATE FAIL
+-set -euo pipefail
+-
+-usage() {
+-  cat <<'EOF'
+-用法: gate.sh --task <任务书路径> [--contract-only]
+-
+-参数:
+-  --task <path>       任务书 Markdown 文件路径（必需）
+-  --contract-only     仅做产物契约校验，跳过 fmt/clippy/test 三段检查
+-  -h, --help          显示此帮助
+-
+-行为:
+-  1) 产物契约校验：解析任务书中「## 产物契约」区块下「- 必需产物：」之后的
+-     每个 "- " 列表项（相对路径，支持 glob）；逐项校验存在且非空
+-     (glob 须至少展开到一个非空文件)。缺失或空 → 记 FAIL。
+-  2) 三段检查（非 --contract-only 时）：
+-     cargo fmt --check
+-     cargo clippy --all-targets -- -D warnings
+-     cargo test --workspace
+-     任一失败 → 记 FAIL。
+-  3) 输出：逐项 "PASS/FAIL: <检查项>"，最后一行 "GATE: PASS" 或 "GATE: FAIL"。
+-
+-退出码: 0=PASS, 1=FAIL
+-EOF
+-}
+-
+-# 参数解析
+-TASK_FILE=""
+-CONTRACT_ONLY=false
+-
+-while [[ $# -gt 0 ]]; do
+-  case "$1" in
+-    --task)
+-      TASK_FILE="${2:-}"
+-      shift 2
+-      ;;
+-    --contract-only)
+-      CONTRACT_ONLY=true
+-      shift
+-      ;;
+-    -h|--help)
+-      usage
+-      exit 0
+-      ;;
+-    *)
+-      echo "未知参数: $1" >&2
+-      usage
+-      exit 2
+-      ;;
+-  esac
+-done
+-
+-if [[ -z "$TASK_FILE" ]]; then
+-  echo "错误: 必需参数 --task <任务书路径>" >&2
+-  usage
+-  exit 2
+-fi
+-
+-# 解析任务书绝对路径（在 cd 之前）
+-TASK_FILE_ABS="$(cd "$(dirname "$TASK_FILE")" && pwd)/$(basename "$TASK_FILE")"
+-if [[ ! -f "$TASK_FILE_ABS" ]]; then
+-  echo "错误: 任务书不存在: $TASK_FILE" >&2
+-  exit 1
+-fi
+-
+-# 确保在仓库根目录
+-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+-cd "$REPO_ROOT"
+-
+-# 解析任务书中的产物契约
+-parse_artifacts() {
+-  local task_file="$1"
+-  local in_contract=false
+-  local in_required=false
+-
+-  while IFS= read -r line; do
+-    # 检测 "## 产物契约" 区块开始
+-    if [[ "$line" =~ ^##[[:space:]]+产物契约 ]]; then
+-      in_contract=true
+-      continue
+-    fi
+-
+-    # 离开二级标题区块
+-    if [[ "$in_contract" == true && "$line" =~ ^##[[:space:]]+ ]]; then
+-      break
+-    fi
+-
+-    # 检测 "- 必需产物："
+-    if [[ "$in_contract" == true && "$line" =~ ^-[[:space:]]+必需产物[：:] ]]; then
+-      in_required=true
+-      continue
+-    fi
+-
+-    # 解析列表项 "- 路径"
+-    if [[ "$in_required" == true && "$line" =~ ^[[:space:]]*-[[:space:]]+(.+) ]]; then
+-      local item="${BASH_REMATCH[1]}"
+-      # 去除行内注释
+-      item="${item%%#*}"
+-      # 去除首尾空白
+-      item="$(echo "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+-      if [[ -n "$item" ]]; then
+-        echo "$item"
+-      fi
+-      continue
+-    fi
+-
+-    # 遇到非列表项且已在必需产物区，结束
+-    if [[ "$in_required" == true && ! "$line" =~ ^[[:space:]]*- ]]; then
+-      break
+-    fi
+-  done < "$task_file"
+-}
+-
+-# 校验单个产物路径（支持 glob）
+-check_artifact() {
+-  local pattern="$1"
+-  local all_nonempty=true
+-
+-  # 判断是否包含 glob 元字符
+-  if [[ "$pattern" == *[\[\*\?]* ]]; then
+-    # glob 模式：使用 nullglob 展开
+-    local saved_nullglob
+-    saved_nullglob=$(shopt -p nullglob 2>/dev/null || echo "unset")
+-    shopt -s nullglob
+-
+-    local matches=()
+-    for f in $pattern; do
+-      matches+=("$f")
+-    done
+-
+-    # 恢复 nullglob 状态
+-    if [[ "$saved_nullglob" == "unset" ]]; then
+-      shopt -u nullglob
+-    else
+-      eval "$saved_nullglob"
+-    fi
+-
+-    if [[ ${#matches[@]} -eq 0 ]]; then
+-      echo "FAIL: $pattern (glob 未命中任何文件)"
+-      return 1
+-    fi
+-
+-    for f in "${matches[@]}"; do
+-      if [[ ! -s "$f" ]]; then
+-        echo "FAIL: $f (存在但为空)"
+-        all_nonempty=false
+-      fi
+-    done
+-  else
+-    # 字面路径：直接检查文件是否存在且非空
+-    if [[ ! -e "$pattern" ]]; then
+-      echo "FAIL: $pattern (文件不存在)"
+-      return 1
+-    fi
+-    if [[ ! -s "$pattern" ]]; then
+-      echo "FAIL: $pattern (存在但为空)"
+-      return 1
+-    fi
+-  fi
+-
+-  if [[ "$all_nonempty" == true ]]; then
+-    echo "PASS: $pattern"
+-    return 0
+-  else
+-    return 1
+-  fi
+-}
+-
+-# 执行三段检查
+-run_checks() {
+-  local checks=(
+-    "cargo fmt --check:fmt"
+-    "cargo clippy --all-targets -- -D warnings:clippy"
+-    "cargo test --workspace:test"
+-  )
+-
+-  local all_pass=true
+-  for check in "${checks[@]}"; do
+-    local cmd="${check%%:*}"
+-    local name="${check##*:}"
+-    if eval "$cmd" >/dev/null 2>&1; then
+-      echo "PASS: $name"
+-    else
+-      echo "FAIL: $name"
+-      all_pass=false
+-    fi
+-  done
+-
+-  if [[ "$all_pass" == true ]]; then
+-    return 0
+-  else
+-    return 1
+-  fi
+-}
+-
+-# 主流程
+-main() {
+-  local artifacts
+-  mapfile -t artifacts < <(parse_artifacts "$TASK_FILE_ABS")
+-
+-  if [[ ${#artifacts[@]} -eq 0 ]]; then
+-    echo "FAIL: 任务书中未找到产物契约（## 产物契约 -> - 必需产物：列表）" >&2
+-    exit 1
+-  fi
+-
+-  local overall_pass=true
+-
+-  # 1. 产物契约校验
+-  for artifact in "${artifacts[@]}"; do
+-    if ! check_artifact "$artifact"; then
+-      overall_pass=false
+-    fi
+-  done
+-
+-  # 2. 三段检查
+-  if [[ "$CONTRACT_ONLY" == false ]]; then
+-    if ! run_checks; then
+-      overall_pass=false
+-    fi
+-  fi
+-
+-  # 最终结果
+-  if [[ "$overall_pass" == true ]]; then
+-    echo "GATE: PASS"
+-    exit 0
+-  else
+-    echo "GATE: FAIL"
+-    exit 1
+-  fi
+-}
+-
+-main "$@"
+\ No newline at end of file
+diff --git a/scripts/rx-draft.sh b/scripts/rx-draft.sh
+new file mode 100755
+index 0000000..e616f4d
+--- /dev/null
++++ b/scripts/rx-draft.sh
+@@ -0,0 +1,278 @@
++#!/usr/bin/env bash
++# rx-draft.sh - Generate prescription draft from task book and evidence
++# Usage: rx-draft.sh --task <任务书路径> --evidence <evidence目录> --out <输出路径>
++# 输出：rx-draft.md（处方草稿，须人工确认后应用，脚本不自动修改任何流程文件）
++
++set -euo pipefail
++
++usage() {
++    cat <<'EOF'
++Usage: rx-draft.sh --task <task_book_path> --evidence <evidence_dir> --out <output_path>
++
++Generate prescription draft from task book and evidence archive.
++Extracts 0-2 improvement prescriptions from review findings and DELIVERY rework records.
++
++Arguments:
++  --task      Path to the task book (markdown file)
++  --evidence  Directory containing review-*-verdict.txt and DELIVERY*.md files
++  --out       Output path for rx-draft.md
++
++Prescription actions (enum, exactly one per prescription):
++  update_task_template  - Modify task book template
++  add_gate_check        - Add machine gate check item
++  append_review_prompt  - Append to review prompt
++
++Output format (rx-draft.md):
++  - Header: "处方草稿，须人工确认后应用，脚本不自动修改任何流程文件"
++  - Each prescription: action:, rationale: (with source line references), status: DRAFT
++  - If no findings and no rework: "无处方建议"
++EOF
++    exit 1
++}
++
++TASK_BOOK=""
++EVIDENCE_DIR=""
++OUTPUT_PATH=""
++
++while [[ $# -gt 0 ]]; do
++    case $1 in
++        --task)
++            TASK_BOOK="${2:-}"
++            shift 2
++            ;;
++        --evidence)
++            EVIDENCE_DIR="${2:-}"
++            shift 2
++            ;;
++        --out)
++            OUTPUT_PATH="${2:-}"
++            shift 2
++            ;;
++        -h|--help)
++            usage
++            ;;
++        *)
++            echo "Error: Unknown argument: $1" >&2
++            usage
++            ;;
++    esac
++done
++
++if [[ -z "$TASK_BOOK" || -z "$EVIDENCE_DIR" || -z "$OUTPUT_PATH" ]]; then
++    echo "Error: Missing required arguments" >&2
++    usage
++fi
++
++if [[ ! -f "$TASK_BOOK" ]]; then
++    echo "Error: Task book not found: $TASK_BOOK" >&2
++    exit 1
++fi
++
++if [[ ! -d "$EVIDENCE_DIR" ]]; then
++    echo "Error: Evidence directory not found: $EVIDENCE_DIR" >&2
++    exit 1
++fi
++
++# Valid prescription actions
++VALID_ACTIONS=("update_task_template" "add_gate_check" "append_review_prompt")
++
++# Extract findings from review verdict files
++extract_findings() {
++    local evidence_dir="$1"
++    local findings=()
++    
++    # Find review verdict files
++    local verdict_files=()
++    while IFS= read -r -d '' file; do
++        verdict_files+=("$file")
++    done < <(find "$evidence_dir" -maxdepth 1 \( -name 'review-*-verdict.txt' -o -name 'review-verdict.txt' \) -print0 2>/dev/null)
++    
++    for verdict_file in "${verdict_files[@]}"; do
++        # Extract lines with CRITICAL/MAJOR/MINOR findings
++        # Two formats supported:
++        # 1. Inline: "MAJOR: finding text" or "MINOR: finding text"
++        # 2. Header + numbered list: "MINOR:" followed by numbered items "1. **Title**: Description"
++        local in_numbered_section=false
++        local current_severity=""
++        local line_num=0
++        
++        while IFS= read -r line; do
++            line_num=$((line_num + 1))
++            
++            # Check for inline format: "SEVERITY: text" (with text on same line)
++            if [[ "$line" =~ ^(CRITICAL|MAJOR|MINOR):[[:space:]]*(.+)$ ]]; then
++                local severity="${BASH_REMATCH[1]}"
++                local text="${BASH_REMATCH[2]}"
++                # Skip findings with empty/whitespace-only text or "None" findings
++                if [[ -n "${text//[[:space:]]/}" ]] && [[ ! "$text" =~ ^None[[:space:]]*[—-]? ]]; then
++                    findings+=("$verdict_file:$line_num:$severity:$text")
++                fi
++                # Reset section tracking
++                in_numbered_section=false
++                current_severity=""
++            # Check for section headers (SEVERITY: with no text on same line)
++            elif [[ "$line" =~ ^(MINOR|MAJOR):[[:space:]]*$ ]]; then
++                in_numbered_section=true
++                current_severity="${BASH_REMATCH[1]}"
++            elif [[ "$line" =~ ^CRITICAL:[[:space:]]*$ ]]; then
++                in_numbered_section=true
++                current_severity="CRITICAL"
++            # Check for numbered items in MINOR/MAJOR/CRITICAL section
++            elif [[ "$in_numbered_section" == "true" && "$line" =~ ^[[:space:]]*[0-9]+\.[[:space:]]+\*\*(.+)\*\*:[[:space:]]*(.+)$ ]]; then
++                local title="${BASH_REMATCH[1]}"
++                local desc="${BASH_REMATCH[2]}"
++                local text="$title: $desc"
++                if [[ -n "${text//[[:space:]]/}" ]]; then
++                    findings+=("$verdict_file:$line_num:$current_severity:$text")
++                fi
++            # Exit section on new section header or non-numbered, non-empty content
++            elif [[ "$line" =~ ^(CRITICAL|MAJOR|MINOR): ]]; then
++                # Will be handled by the first condition above
++                in_numbered_section=false
++                current_severity=""
++            elif [[ -n "$line" && "$in_numbered_section" == "true" && ! "$line" =~ ^[[:space:]]*[0-9]+\. ]]; then
++                # Non-empty, non-numbered line in a numbered section -> end section
++                in_numbered_section=false
++                current_severity=""
++            fi
++            # Empty lines do NOT end the numbered section
++        done < "$verdict_file"
++    done
++    
++    printf '%s\n' "${findings[@]}"
++}
++
++# Extract rework/legacy items from DELIVERY files
++extract_delivery_rework() {
++    local evidence_dir="$1"
++    local rework_items=()
++    
++    local delivery_files=()
++    while IFS= read -r -d '' file; do
++        delivery_files+=("$file")
++    done < <(find "$evidence_dir" -maxdepth 1 -name 'DELIVERY*.md' -print0 2>/dev/null)
++    
++    for delivery_file in "${delivery_files[@]}"; do
++        # Look for rework/legacy/remaining issues sections
++        # Patterns: "返工", "遗留", "remaining", "rework", "follow-up", "后续"
++        while IFS= read -r line; do
++            if [[ "$line" =~ (返工|遗留|remaining|rework|follow-up|后续|未解决|待解决) ]]; then
++                local line_num
++                line_num=$(grep -n -F "$line" "$delivery_file" | head -1 | cut -d: -f1)
++                rework_items+=("$delivery_file:$line_num:$line")
++            fi
++        done < "$delivery_file"
++    done
++    
++    printf '%s\n' "${rework_items[@]}"
++}
++
++# Map finding/rework to prescription action
++# Heuristic mapping based on content keywords
++map_to_action() {
++    local text="$1"
++    local text_lower="${text,,}"
++    
++    # Keywords for each action
++    if [[ "$text_lower" =~ (模板|template|任务书格式|task.book.format|任务书结构) ]]; then
++        echo "update_task_template"
++    elif [[ "$text_lower" =~ (机器门|gate.check|自动检查|ci.check|检查项|lint|clippy|fmt|测试覆盖|test.coverage) ]]; then
++        echo "add_gate_check"
++    elif [[ "$text_lower" =~ (审查提示|review.prompt|评审提示|reviewer指引|review指引|审查关注点|review.focus) ]]; then
++        echo "append_review_prompt"
++    elif [[ "$text_lower" =~ (哈希|hash|校验|verify|checksum|一致性|consistency) ]]; then
++        echo "add_gate_check"
++    elif [[ "$text_lower" =~ (配置|config|格式|format|结构|structure) ]]; then
++        echo "update_task_template"
++    else
++        # Default: append_review_prompt for general process improvements
++        echo "append_review_prompt"
++    fi
++}
++
++# Generate prescription from finding/rework
++generate_prescription() {
++    local source_file="$1"
++    local line_num="$2"
++    local severity="$3"
++    local text="$4"
++    local action
++    
++    action=$(map_to_action "$text")
++    
++    # Validate action
++    local valid=false
++    for a in "${VALID_ACTIONS[@]}"; do
++        if [[ "$a" == "$action" ]]; then
++            valid=true
++            break
++        fi
++    done
++    
++    if [[ "$valid" != "true" ]]; then
++        action="append_review_prompt"  # fallback
++    fi
++    
++    cat <<EOF
++- action: $action
++  rationale: "$text" (source: $source_file:$line_num)
++  status: DRAFT
++EOF
++}
++
++# Main logic
++main() {
++    local all_findings=()
++    local all_rework=()
++    
++    # Extract findings
++    while IFS= read -r line; do
++        [[ -n "$line" ]] && all_findings+=("$line")
++    done < <(extract_findings "$EVIDENCE_DIR")
++    
++    # Extract DELIVERY rework items
++    while IFS= read -r line; do
++        [[ -n "$line" ]] && all_rework+=("$line")
++    done < <(extract_delivery_rework "$EVIDENCE_DIR")
++    
++    # Generate prescriptions (max 2)
++    local prescriptions=()
++    local count=0
++    
++    # Process findings first (higher priority)
++    for finding in "${all_findings[@]}"; do
++        if [[ $count -ge 2 ]]; then break; fi
++        IFS=':' read -r source_file line_num severity text <<< "$finding"
++        prescriptions+=("$(generate_prescription "$source_file" "$line_num" "$severity" "$text")")
++        count=$((count + 1))
++    done
++    
++    # Process rework items if slots remain
++    for rework in "${all_rework[@]}"; do
++        if [[ $count -ge 2 ]]; then break; fi
++        IFS=':' read -r source_file line_num text <<< "$rework"
++        prescriptions+=("$(generate_prescription "$source_file" "$line_num" "REWORK" "$text")")
++        count=$((count + 1))
++    done
++    
++    # Write output
++    {
++        echo "# 处方草稿"
++        echo ""
++        echo "> 处方草稿，须人工确认后应用，脚本不自动修改任何流程文件"
++        echo ""
++        
++        if [[ ${#prescriptions[@]} -eq 0 ]]; then
++            echo "无处方建议"
++        else
++            for p in "${prescriptions[@]}"; do
++                echo "$p"
++                echo ""
++            done
++        fi
++    } > "$OUTPUT_PATH"
++    
++    echo "Prescription draft written to: $OUTPUT_PATH"
++}
++
++main "$@"
+\ No newline at end of file
+diff --git a/scripts/rx-selftest.sh b/scripts/rx-selftest.sh
+new file mode 100755
+index 0000000..1731226
+--- /dev/null
++++ b/scripts/rx-selftest.sh
+@@ -0,0 +1,415 @@
++#!/usr/bin/env bash
++# rx-selftest.sh - Self-test for rx-draft.sh
++# Tests three scenarios:
++# 1. With findings -> generates 1-2 prescriptions
++# 2. No findings -> outputs "无处方建议"
++# 3. Invalid action rejected (though our script maps to valid actions)
++
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++RX_DRAFT="$SCRIPT_DIR/rx-draft.sh"
++
++if [[ ! -x "$RX_DRAFT" ]]; then
++    echo "Error: $RX_DRAFT not found or not executable" >&2
++    exit 1
++fi
++
++TEST_COUNT=0
++PASS_COUNT=0
++FAIL_COUNT=0
++
++run_test() {
++    local test_name="$1"
++    local test_fn="$2"
++    
++    TEST_COUNT=$((TEST_COUNT + 1))
++    echo "=== Test $TEST_COUNT: $test_name ==="
++    
++    local temp_dir
++    temp_dir=$(mktemp -d)
++    
++    # Run test function with temp_dir as argument
++    if "$test_fn" "$temp_dir"; then
++        echo "Result: PASS"
++        PASS_COUNT=$((PASS_COUNT + 1))
++    else
++        echo "Result: FAIL"
++        FAIL_COUNT=$((FAIL_COUNT + 1))
++    fi
++    
++    # Cleanup
++    rm -rf "$temp_dir"
++    echo ""
++}
++
++# Test 1: With findings -> generates 1-2 prescriptions
++test_with_findings() {
++    local temp_dir="$1"
++    
++    local task_book="$temp_dir/task.md"
++    local evidence_dir="$temp_dir/evidence"
++    local output="$temp_dir/rx-draft.md"
++    
++    mkdir -p "$evidence_dir"
++    
++    # Create task book
++    cat > "$task_book" <<'EOF'
++# Task Book: Test Task
++
++## Objective
++Fix the evidence CLI download issue.
++
++## Acceptance Criteria
++- CLI downloads evidence correctly
++- Hash verification passes
++EOF
++    
++    # Create review verdict with findings
++    cat > "$evidence_dir/review-test-verdict.txt" <<'EOF'
++VERDICT: APPROVE
++
++Findings:
++
++MAJOR: Hash verification mismatch in DELIVERY report - reported hashes differ from evidence table
++
++MINOR: 
++1. Config format inconsistency in central.toml (pre-existing)
++2. Missing machine gate check for hash consistency verification
++EOF
++    
++    # Create DELIVERY with rework note
++    cat > "$evidence_dir/DELIVERY-test.md" <<'EOF'
++# DELIVERY Test
++
++## Summary
++Task completed.
++
++## Rework Items
++遗留: Need to add automated hash verification gate check in CI pipeline.
++EOF
++    
++    # Run rx-draft.sh
++    "$RX_DRAFT" --task "$task_book" --evidence "$evidence_dir" --out "$output"
++    
++    # Verify output
++    if [[ ! -f "$output" ]]; then
++        echo "FAIL: Output file not created"
++        return 1
++    fi
++    
++    local content
++    content=$(cat "$output")
++    echo "Output content:"
++    echo "$content"
++    echo "---"
++    
++    # Check header
++    if ! grep -q "处方草稿，须人工确认后应用，脚本不自动修改任何流程文件" "$output"; then
++        echo "FAIL: Missing header disclaimer"
++        return 1
++    fi
++    
++    # Check has prescriptions (not "无处方建议")
++    if grep -q "无处方建议" "$output"; then
++        echo "FAIL: Should have prescriptions but got '无处方建议'"
++        return 1
++    fi
++    
++    # Check has action: field with valid action
++    if ! grep -q "action:" "$output"; then
++        echo "FAIL: Missing action field"
++        return 1
++    fi
++    
++    # Check action is one of valid enum
++    local actions
++    actions=$(grep "action:" "$output" | sed 's/.*action: *//')
++    for action in $actions; do
++        case "$action" in
++            update_task_template|add_gate_check|append_review_prompt)
++                ;;
++            *)
++                echo "FAIL: Invalid action: $action"
++                return 1
++                ;;
++        esac
++    done
++    
++    # Check rationale field exists
++    if ! grep -q "rationale:" "$output"; then
++        echo "FAIL: Missing rationale field"
++        return 1
++    fi
++    
++    # Check status: DRAFT
++    if ! grep -q "status: DRAFT" "$output"; then
++        echo "FAIL: Missing status: DRAFT"
++        return 1
++    fi
++    
++    # Check max 2 prescriptions
++    local prescription_count
++    prescription_count=$(grep -c "action:" "$output" || true)
++    if [[ $prescription_count -gt 2 ]]; then
++        echo "FAIL: More than 2 prescriptions ($prescription_count)"
++        return 1
++    fi
++    
++    if [[ $prescription_count -lt 1 ]]; then
++        echo "FAIL: Less than 1 prescription ($prescription_count)"
++        return 1
++    fi
++    
++    echo "PASS: Generated $prescription_count prescription(s) with valid actions"
++    return 0
++}
++
++# Test 2: No findings -> outputs "无处方建议"
++test_no_findings() {
++    local temp_dir="$1"
++    
++    local task_book="$temp_dir/task.md"
++    local evidence_dir="$temp_dir/evidence"
++    local output="$temp_dir/rx-draft.md"
++    
++    mkdir -p "$evidence_dir"
++    
++    # Create task book
++    cat > "$task_book" <<'EOF'
++# Task Book: Clean Task
++
++## Objective
++Simple task with no issues.
++
++## Acceptance Criteria
++- All checks pass
++EOF
++    
++    # Create review verdict with NO findings
++    cat > "$evidence_dir/review-clean-verdict.txt" <<'EOF'
++VERDICT: APPROVE
++
++Findings:
++
++MAJOR: None — all acceptance criteria satisfied.
++
++MINOR: None
++EOF
++    
++    # Create DELIVERY with no rework
++    cat > "$evidence_dir/DELIVERY-clean.md" <<'EOF'
++# DELIVERY Clean
++
++## Summary
++Task completed successfully with no issues.
++All items addressed.
++EOF
++    
++    # Run rx-draft.sh
++    "$RX_DRAFT" --task "$task_book" --evidence "$evidence_dir" --out "$output"
++    
++    # Verify output
++    if [[ ! -f "$output" ]]; then
++        echo "FAIL: Output file not created"
++        return 1
++    fi
++    
++    local content
++    content=$(cat "$output")
++    echo "Output content:"
++    echo "$content"
++    echo "---"
++    
++    # Check header
++    if ! grep -q "处方草稿，须人工确认后应用，脚本不自动修改任何流程文件" "$output"; then
++        echo "FAIL: Missing header disclaimer"
++        return 1
++    fi
++    
++    # Check outputs "无处方建议"
++    if ! grep -q "无处方建议" "$output"; then
++        echo "FAIL: Expected '无处方建议' but not found"
++        return 1
++    fi
++    
++    # Should NOT have action fields
++    if grep -q "action:" "$output"; then
++        echo "FAIL: Should not have action fields when no findings"
++        return 1
++    fi
++    
++    echo "PASS: Correctly outputs '无处方建议' for clean case"
++    return 0
++}
++
++# Test 3: Invalid action rejected (our script maps to valid actions, but test the enum validation)
++test_invalid_action_rejected() {
++    local temp_dir="$1"
++    
++    local task_book="$temp_dir/task.md"
++    local evidence_dir="$temp_dir/evidence"
++    local output="$temp_dir/rx-draft.md"
++    
++    mkdir -p "$evidence_dir"
++    
++    # Create task book
++    cat > "$task_book" <<'EOF'
++# Task Book: Edge Case Task
++
++## Objective
++Test action mapping.
++EOF
++    
++    # Create review verdict with text that doesn't match any keyword
++    # This should map to default action (append_review_prompt)
++    cat > "$evidence_dir/review-edge-verdict.txt" <<'EOF'
++VERDICT: APPROVE
++
++Findings:
++
++MINOR: Some completely unrelated text that matches no keywords xyzabc123
++EOF
++    
++    # No DELIVERY file
++    
++    # Run rx-draft.sh
++    "$RX_DRAFT" --task "$task_book" --evidence "$evidence_dir" --out "$output"
++    
++    # Verify output
++    if [[ ! -f "$output" ]]; then
++        echo "FAIL: Output file not created"
++        return 1
++    fi
++    
++    local content
++    content=$(cat "$output")
++    echo "Output content:"
++    echo "$content"
++    echo "---"
++    
++    # Check header
++    if ! grep -q "处方草稿，须人工确认后应用，脚本不自动修改任何流程文件" "$output"; then
++        echo "FAIL: Missing header disclaimer"
++        return 1
++    fi
++    
++    # Check action is valid (should be append_review_prompt as default)
++    local action
++    action=$(grep "action:" "$output" | sed 's/.*action: *//' | head -1)
++    
++    case "$action" in
++        update_task_template|add_gate_check|append_review_prompt)
++            echo "PASS: Invalid input text correctly mapped to valid action: $action"
++            return 0
++            ;;
++        *)
++            echo "FAIL: Action '$action' is not a valid enum value"
++            return 1
++            ;;
++    esac
++}
++
++# Test 4: Exit code verification (success cases)
++test_exit_codes() {
++    local temp_dir="$1"
++    
++    local task_book="$temp_dir/task.md"
++    local evidence_dir="$temp_dir/evidence"
++    local output="$temp_dir/rx-draft.md"
++    
++    mkdir -p "$evidence_dir"
++    
++    cat > "$task_book" <<'EOF'
++# Task Book
++EOF
++    
++    cat > "$evidence_dir/review-verdict.txt" <<'EOF'
++VERDICT: APPROVE
++Findings:
++MINOR: Test finding
++EOF
++    
++    # Test successful execution returns 0
++    if "$RX_DRAFT" --task "$task_book" --evidence "$evidence_dir" --out "$output"; then
++        echo "PASS: Successful execution returns exit code 0"
++        return 0
++    else
++        echo "FAIL: Successful execution returned non-zero exit code"
++        return 1
++    fi
++}
++
++# Test 5: Error handling - missing arguments
++test_missing_args() {
++    local temp_dir="$1"
++    
++    # Test missing --task
++    if "$RX_DRAFT" --evidence "$temp_dir" --out "$temp_dir/out.md" 2>/dev/null; then
++        echo "FAIL: Should fail with missing --task"
++        return 1
++    fi
++    
++    # Test missing --evidence
++    if "$RX_DRAFT" --task "$temp_dir/task.md" --out "$temp_dir/out.md" 2>/dev/null; then
++        echo "FAIL: Should fail with missing --evidence"
++        return 1
++    fi
++    
++    # Test missing --out
++    if "$RX_DRAFT" --task "$temp_dir/task.md" --evidence "$temp_dir" 2>/dev/null; then
++        echo "FAIL: Should fail with missing --out"
++        return 1
++    fi
++    
++    echo "PASS: Correctly rejects missing arguments"
++    return 0
++}
++
++# Test 6: Error handling - non-existent paths
++test_nonexistent_paths() {
++    local temp_dir="$1"
++    
++    local output="$temp_dir/out.md"
++    
++    # Test non-existent task book
++    if "$RX_DRAFT" --task "$temp_dir/nonexistent.md" --evidence "$temp_dir" --out "$output" 2>/dev/null; then
++        echo "FAIL: Should fail with non-existent task book"
++        return 1
++    fi
++    
++    # Test non-existent evidence dir
++    mkdir -p "$temp_dir/task.md"
++    if "$RX_DRAFT" --task "$temp_dir/task.md" --evidence "$temp_dir/nonexistent" --out "$output" 2>/dev/null; then
++        echo "FAIL: Should fail with non-existent evidence dir"
++        return 1
++    fi
++    
++    echo "PASS: Correctly rejects non-existent paths"
++    return 0
++}
++
++# Run all tests
++echo "Starting rx-draft.sh self-tests..."
++echo ""
++
++run_test "With findings generates 1-2 prescriptions" test_with_findings
++run_test "No findings outputs 无处方建议" test_no_findings
++run_test "Invalid action text maps to valid enum" test_invalid_action_rejected
++run_test "Exit code 0 on success" test_exit_codes
++run_test "Missing arguments rejected" test_missing_args
++run_test "Non-existent paths rejected" test_nonexistent_paths
++
++# Summary
++echo "=== SELFTEST SUMMARY ==="
++echo "Total tests: $TEST_COUNT"
++echo "Passed: $PASS_COUNT"
++echo "Failed: $FAIL_COUNT"
++
++if [[ $FAIL_COUNT -eq 0 ]]; then
++    echo "SELFTEST: PASS"
++    exit 0
++else
++    echo "SELFTEST: FAIL"
++    exit 1
++fi
+\ No newline at end of file
